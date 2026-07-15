@@ -1,0 +1,32 @@
+# CodeRabbit baseline config (machine Git Workflow Standard §6.3).
+# Conservative defaults — per-repo tuning happens later, in this file, in-repo.
+# Schema: https://docs.coderabbit.ai/reference/configuration
+language: en-US
+early_access: false
+reviews:
+  # Review profile: "chill" keeps noise low; switch to "assertive" per-repo if wanted.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  walkthrough: true
+  auto_review:
+    enabled: true
+    # Drafts are skipped until marked ready-for-review (spec §6.2).
+    drafts: false
+  # Enforce Conventional Commit style PR titles.
+  title_check:
+    enabled: true
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/*.min.*"
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/pnpm-lock.yaml"
+    - "!**/__pycache__/**"
+    - "!**/*.lock"
+chat:
+  auto_reply: true
