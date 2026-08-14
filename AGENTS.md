@@ -21,7 +21,8 @@ This repo follows /home/dyadmin/AGENTS.md "Git Workflow Standard".
 - Default branch: main (protected, PR-only, squash merge)
 - Branches: feat/ fix/ chore/ docs/ exp/ (+ agent/<harness>/ optional)
 - Commits: Conventional Commits; hooks must pass; never --no-verify
-- Review: CodeRabbit auto-reviews PRs (config: .coderabbit.yaml); address all
-  findings, then request David's approval (agent PRs require it)
+- Review: run `/code-reviewer` (the code-reviewer specialist, on `fable`)
+  before opening a PR — since CodeRabbit's removal on 2026-07-29 it is the
+  only review a PR gets; then request David's approval (agent PRs require it)
 - Deploy coupling: <none | "merging main deploys to X — humans merge">
 - Long-lived branch exceptions: <none | list + purpose>
