@@ -184,6 +184,46 @@ class InstrumentedRunTests(unittest.TestCase):
         self.assertIn("502", record.error)
         self.assertIsNone(record.reported_cost_usd)
 
+    # --- NEGATIVE CONTROL -------------------------------------------------
+    def test_an_unexpected_exception_is_still_a_ledger_row(self):
+        """An attempt that dies for a reason nobody anticipated still consumed
+        an attempt. Recording only the anticipated failures understates the
+        retry multiplier just as badly as recording none."""
+
+        class ExplodingClient:
+            api_key = "sk-fake"
+
+            def chat(self, model, messages, **kwargs):
+                raise ZeroDivisionError("something nobody planned for")
+
+        outcome = self.router.run(
+            client=ExplodingClient(),
+            messages=[{"role": "user", "content": "hi"}],
+            task=self.task,
+            ledger=self.ledger,
+            task_label="lesson-7",
+        )
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIsInstance(outcome.error, ZeroDivisionError)
+        record = self.ledger.read_all()[-1]
+        self.assertEqual(record.status, STATUS_ERROR)
+        self.assertIn("ZeroDivisionError", record.error)
+
+    def test_unexpected_exception_is_re_raised_by_chat_completion(self):
+        class ExplodingClient:
+            def chat(self, model, messages, **kwargs):
+                raise ZeroDivisionError("boom")
+
+        with self.assertRaises(ZeroDivisionError):
+            self.router.chat_completion(
+                client=ExplodingClient(),
+                messages=[{"role": "user", "content": "hi"}],
+                task=self.task,
+                ledger=self.ledger,
+            )
+        self.assertEqual(self.ledger.read_all()[-1].status, STATUS_ERROR)
+
     def test_selection_failure_is_still_a_ledger_row(self):
         client, _ = _client(REAL_SHAPE_RESPONSE)
 

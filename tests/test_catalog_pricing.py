@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from openrouter_model_router import FakeTransport, ModelCatalog, ModelRouter, TaskSpec
-from openrouter_model_router.catalog import CatalogRefreshError, model_from_openrouter
+from openrouter_model_router.catalog import CatalogLoadError, CatalogRefreshError, model_from_openrouter
 from openrouter_model_router.transport import HttpResponse
 
 PAYLOAD = {
@@ -69,6 +69,54 @@ class RefreshTests(unittest.TestCase):
 
         self.assertIn("503", str(ctx.exception))
         self.assertIn("upstream unavailable", str(ctx.exception))
+
+
+class CorruptCatalogTests(unittest.TestCase):
+    """A corrupt catalog must not degrade into the unpriced bootstrap.
+
+    That failure is invisible: the run looks healthy and every estimate is
+    $0.00, which is exactly the bug this branch exists to kill.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "catalog.json"
+
+    def test_truncated_catalog_raises_instead_of_bootstrapping(self):
+        self.path.write_text('{"models": [{"id": "a/b"')
+
+        with self.assertRaises(CatalogLoadError) as ctx:
+            ModelCatalog.load(self.path, bootstrap=True)
+
+        self.assertIn("Refusing to fall back", str(ctx.exception))
+
+    def test_catalog_of_the_wrong_json_type_raises(self):
+        self.path.write_text("[]")
+
+        with self.assertRaises(CatalogLoadError):
+            ModelCatalog.load(self.path)
+
+    def test_a_genuinely_absent_catalog_still_bootstraps(self):
+        """Missing is not corrupt - the fallback must still work."""
+
+        catalog = ModelCatalog.load(Path(self._tmp.name) / "absent.json", bootstrap=True)
+
+        self.assertEqual(len(catalog), 1)
+
+    def test_cli_reports_a_corrupt_catalog_cleanly(self):
+        import contextlib
+        import io
+
+        from openrouter_model_router.cli import main
+
+        self.path.write_text("{not json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = main(["estimate", "--catalog", str(self.path)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("could not be read", err.getvalue())
 
 
 class PricingKnownTests(unittest.TestCase):

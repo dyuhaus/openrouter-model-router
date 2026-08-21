@@ -117,3 +117,51 @@ class CliCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshCoverageGateTests(unittest.TestCase):
+    """`refresh` must not report success after writing a catalog nothing can be
+    costed from. That state is silent otherwise: exit 0, a file on disk, and
+    every downstream estimate $0.00."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "catalog.json"
+
+    @staticmethod
+    def _payload(pricing):
+        return {"data": [{"id": "vendor/model", "context_length": 100_000, **({"pricing": pricing} if pricing else {})}]}
+
+    def _refresh_with(self, payload):
+        from unittest import mock
+
+        from openrouter_model_router import ModelCatalog
+
+        built = ModelCatalog.from_openrouter_payload(payload)
+        with mock.patch.object(ModelCatalog, "refresh_from_openrouter", return_value=built):
+            return run_cli(["refresh", "--catalog", str(self.path)])
+
+    def test_refresh_reports_pricing_coverage(self):
+        code, out, _ = self._refresh_with(self._payload({"prompt": "0.000001", "completion": "0.000002"}))
+
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual(report["models"], 1)
+        self.assertEqual(report["pricing"]["priced"], 1)
+        self.assertEqual(report["pricing"]["pricing_unknown"], 0)
+        self.assertFalse(report["authenticated"])
+
+    # --- NEGATIVE CONTROL -------------------------------------------------
+    def test_refresh_exits_nonzero_when_nothing_can_be_priced(self):
+        code, out, err = self._refresh_with(self._payload({"prompt": "-1", "completion": "-1"}))
+
+        self.assertEqual(code, 1, "a refresh that cannot price anything must not report success")
+        self.assertEqual(json.loads(out)["pricing"]["priced"], 0)
+        self.assertIn("$0.00", err)
+
+    def test_refresh_with_no_pricing_block_at_all_also_fails(self):
+        code, _, err = self._refresh_with(self._payload(None))
+
+        self.assertEqual(code, 1)
+        self.assertIn("NO model carries a usable price", err)

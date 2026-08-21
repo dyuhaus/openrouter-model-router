@@ -8,7 +8,13 @@ import os
 import sys
 from pathlib import Path
 
-from .catalog import OPENROUTER_BASE_URL, CatalogRefreshError, ModelCatalog, default_catalog_path
+from .catalog import (
+    OPENROUTER_BASE_URL,
+    CatalogLoadError,
+    CatalogRefreshError,
+    ModelCatalog,
+    default_catalog_path,
+)
 from .ledger import RunLedger
 from .reconcile import DEFAULT_TOLERANCE, format_report, reconcile
 from .router import ModelRouter
@@ -64,20 +70,25 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    if args.command in {"refresh", "research", "update"}:
-        return _refresh(args)
-    if args.command == "select":
-        return _select(args)
-    if args.command == "record-outcome":
-        return _record_outcome(args)
-    if args.command == "estimate":
-        return _estimate(args)
-    if args.command == "ledger":
-        return _ledger(args)
-    if args.command == "reconcile":
-        return _reconcile(args)
-    parser.error(f"unknown command: {args.command}")
-    return 2
+    handlers = {
+        "refresh": _refresh,
+        "research": _refresh,
+        "update": _refresh,
+        "select": _select,
+        "record-outcome": _record_outcome,
+        "estimate": _estimate,
+        "ledger": _ledger,
+        "reconcile": _reconcile,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
+        parser.error(f"unknown command: {args.command}")
+        return 2
+    try:
+        return handler(args)
+    except CatalogLoadError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def _add_task_args(parser: argparse.ArgumentParser) -> None:

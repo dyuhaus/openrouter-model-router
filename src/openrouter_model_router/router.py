@@ -199,7 +199,13 @@ class ModelRouter:
 
         try:
             result = client.chat(selection.model.id, messages, **kwargs)
-        except OpenRouterError as exc:
+        except Exception as exc:  # noqa: BLE001 - an unrecorded attempt is a lost attempt
+            # Deliberately broader than OpenRouterError. An attempt that dies for
+            # an unexpected reason still consumed an attempt, and a ledger that
+            # only knows about the failures it anticipated understates the retry
+            # multiplier exactly like one that drops failures altogether. The
+            # exception is preserved on the outcome and re-raised by
+            # chat_completion; nothing is swallowed.
             return self._finish(
                 ledger=ledger,
                 record=RunRecord(status=STATUS_ERROR, error=f"{type(exc).__name__}: {exc}", **base),
@@ -232,7 +238,12 @@ class ModelRouter:
         error: Exception | None = None,
     ) -> RunOutcome:
         if ledger is not None:
-            ledger.append(record)
+            try:
+                ledger.append(record)
+            except OSError as exc:
+                # A ledger that cannot be written is a broken measurement, not a
+                # detail to swallow -- but it must not erase the original failure.
+                raise OSError(f"failed to append to the run ledger: {exc}") from (error or exc)
         return RunOutcome(record=record, selection=selection, result=result, error=error)
 
     def _compatible(self, model: ModelInfo, spec: TaskSpec) -> tuple[bool, list[str]]:

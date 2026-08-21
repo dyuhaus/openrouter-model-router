@@ -25,6 +25,15 @@ class CatalogRefreshError(RuntimeError):
     """Raised when the OpenRouter catalog cannot be fetched or parsed."""
 
 
+class CatalogLoadError(RuntimeError):
+    """Raised when an on-disk catalog exists but cannot be read.
+
+    Distinct from "no catalog" on purpose. A truncated or hand-edited catalog
+    must not fall through to the unpriced bootstrap, because that failure looks
+    identical to a healthy run right up until every cost estimate is $0.00.
+    """
+
+
 class ModelCatalog:
     """A mutable collection of routable model metadata."""
 
@@ -67,8 +76,19 @@ class ModelCatalog:
         target = Path(path).expanduser() if path else default_catalog_path()
         if not target.exists():
             return cls.bootstrap() if bootstrap else cls()
-        data = json.loads(target.read_text())
-        models = [ModelInfo.from_dict(item) for item in data.get("models", [])]
+        try:
+            data = json.loads(target.read_text())
+            if not isinstance(data, dict):
+                raise CatalogLoadError(f"{target}: expected a JSON object, got {type(data).__name__}")
+            models = [ModelInfo.from_dict(item) for item in data.get("models", [])]
+        except CatalogLoadError:
+            raise
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as exc:
+            raise CatalogLoadError(
+                f"{target} exists but could not be read ({type(exc).__name__}: {exc}). "
+                "Refusing to fall back to the unpriced bootstrap catalog - "
+                "run `openrouter-model-router refresh` to rewrite it."
+            ) from exc
         return cls(models=models, updated_at=data.get("updated_at"))
 
     @classmethod

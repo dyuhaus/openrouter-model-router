@@ -1,6 +1,6 @@
 """Lightweight OpenRouter model routing with cost instrumentation."""
 
-from .catalog import ModelCatalog, default_catalog_path
+from .catalog import CatalogLoadError, CatalogRefreshError, ModelCatalog, default_catalog_path
 from .ledger import RunLedger, RunRecord, default_ledger_path
 from .openrouter import ChatResult, OpenRouterClient, OpenRouterError
 from .reconcile import ReconciliationReport, format_report, reconcile
@@ -10,6 +10,8 @@ from .types import ModelInfo, Selection, TaskSpec
 from .usage import TokenUsage, parse_usage
 
 __all__ = [
+    "CatalogLoadError",
+    "CatalogRefreshError",
     "ChatResult",
     "FakeTransport",
     "HttpRequest",
