@@ -2,6 +2,9 @@ import unittest
 
 from openrouter_model_router.ledger import RunRecord
 from openrouter_model_router.reconcile import (
+    CAUSE_NO_PRICE,
+    CAUSE_STALE_PRICE,
+    CAUSE_TOKEN_ESTIMATE,
     STATUS_DRIFT,
     STATUS_INSUFFICIENT_DATA,
     STATUS_OK,
@@ -10,8 +13,16 @@ from openrouter_model_router.reconcile import (
 )
 
 
-def _run(model="a/b", estimated=None, reported=None):
-    return RunRecord(model=model, estimated_cost_usd=estimated, reported_cost_usd=reported)
+def _run(model="a/b", estimated=None, reported=None, est_tokens=None, actual_tokens=None):
+    """One ledger row. Token counts are optional: pass (in, out) pairs to
+    exercise the stale-price vs wrong-token-estimate diagnosis."""
+
+    kwargs = {}
+    if est_tokens is not None:
+        kwargs["estimated_input_tokens"], kwargs["estimated_output_tokens"] = est_tokens
+    if actual_tokens is not None:
+        kwargs["prompt_tokens"], kwargs["completion_tokens"] = actual_tokens
+    return RunRecord(model=model, estimated_cost_usd=estimated, reported_cost_usd=reported, **kwargs)
 
 
 class ReconcileTests(unittest.TestCase):
@@ -37,8 +48,41 @@ class ReconcileTests(unittest.TestCase):
         drift = report.flagged_models[0]
         self.assertAlmostEqual(drift.absolute_drift_usd, 0.30)
         self.assertAlmostEqual(drift.relative_drift, 3.0)
-        self.assertIn("refresh the catalog", drift.reason)
+        self.assertEqual(drift.cause, CAUSE_STALE_PRICE)
+        self.assertIn("stale catalog price", drift.reason)
         self.assertIn("FLAG", format_report(report))
+
+    def test_agreeing_tokens_with_diverging_cost_blames_the_catalog(self):
+        """Same tokens, different money: the price moved."""
+
+        report = reconcile(
+            [_run(model="stale/model", estimated=0.10, reported=0.40,
+                  est_tokens=(8000, 2000), actual_tokens=(8000, 2000))]
+        )
+
+        drift = report.flagged_models[0]
+        self.assertEqual(drift.cause, CAUSE_STALE_PRICE)
+        self.assertIn("catalog price is stale", drift.reason)
+        self.assertEqual(drift.token_drift, 0.0)
+
+    # --- NEGATIVE CONTROL -------------------------------------------------
+    def test_diverging_tokens_blames_the_estimate_not_the_catalog(self):
+        """The catalog is CORRECT here; only the TaskSpec sizes were wrong.
+        Telling someone to refresh a catalog that is already right sends them
+        to fix the wrong thing."""
+
+        report = reconcile(
+            [_run(model="fine/model", estimated=0.002, reported=0.000078,
+                  est_tokens=(1000, 1000), actual_tokens=(194, 88))]
+        )
+
+        drift = report.flagged_models[0]
+        self.assertEqual(drift.cause, CAUSE_TOKEN_ESTIMATE)
+        self.assertIn("token sizes are wrong, not the catalog price", drift.reason)
+        self.assertNotIn("stale", drift.reason)
+        self.assertEqual(drift.estimated_tokens, 2000)
+        self.assertEqual(drift.reported_tokens, 282)
+        self.assertEqual(report.causes, {CAUSE_TOKEN_ESTIMATE: 1})
 
     def test_zero_estimate_against_a_real_charge_is_flagged(self):
         """The exact bug this repo shipped: a $0.00 estimate that cost money."""
@@ -47,6 +91,7 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual(report.status, STATUS_DRIFT)
         self.assertIn("no price for this model", report.flagged_models[0].reason)
+        self.assertEqual(report.flagged_models[0].cause, CAUSE_NO_PRICE)
 
     def test_drift_inside_tolerance_is_not_flagged(self):
         report = reconcile([_run(estimated=1.00, reported=1.05)], tolerance=0.10)

@@ -2,9 +2,20 @@
 
 This is the check that catches a stale price catalog. The router estimates from
 catalog prices captured at refresh time; the provider reports what it actually
-charged. When those two diverge past a tolerance the catalog -- not the
-provider -- is wrong, and every downstream cost-per-course number is wrong with
-it.
+charged. When those two diverge past a tolerance, something on OUR side is wrong and
+every downstream cost-per-course number is wrong with it. Two causes produce the
+same signal and both matter:
+
+* the catalog price is stale -- the provider repriced and nobody refreshed;
+* the ``TaskSpec`` token counts are wrong -- the estimate was built from guessed
+  input/output sizes that do not match what was actually sent.
+
+The report tells the two apart itself, by comparing the ledger's
+``estimated_input_tokens``/``estimated_output_tokens`` against the reported
+``prompt_tokens``/``completion_tokens``: if the token counts agree and the cost
+does not, the price is stale; if the token counts disagree too, the estimate was
+built on the wrong sizes. Blaming the catalog for a token-estimate error would
+send someone to refresh a catalog that is already correct.
 
 Drift is reported per model and overall. A run that carries only one of the two
 numbers is *excluded from the drift maths and counted separately*, because
@@ -21,6 +32,11 @@ from .ledger import RunRecord
 
 DEFAULT_TOLERANCE = 0.10  # 10% relative drift before a model is flagged.
 DEFAULT_ABSOLUTE_FLOOR_USD = 0.0005  # Ignore drift on runs too cheap to matter.
+TOKEN_TOLERANCE = 0.10  # Token drift beyond this means the estimate's sizes were wrong.
+
+CAUSE_STALE_PRICE = "stale_catalog_price"
+CAUSE_TOKEN_ESTIMATE = "wrong_token_estimate"
+CAUSE_NO_PRICE = "no_catalog_price"
 
 STATUS_OK = "ok"
 STATUS_DRIFT = "drift"
@@ -35,8 +51,20 @@ class ModelDrift:
     reported_cost_usd: float = 0.0
     missing_reported: int = 0
     missing_estimate: int = 0
+    estimated_tokens: int = 0
+    reported_tokens: int = 0
+    token_comparable_runs: int = 0
     flagged: bool = False
+    cause: str | None = None
     reason: str = ""
+
+    @property
+    def token_drift(self) -> float | None:
+        """Relative difference between estimated and actually-used tokens."""
+
+        if self.token_comparable_runs == 0 or self.estimated_tokens <= 0:
+            return None
+        return round((self.reported_tokens - self.estimated_tokens) / self.estimated_tokens, 6)
 
     @property
     def absolute_drift_usd(self) -> float:
@@ -58,7 +86,11 @@ class ModelDrift:
             "relative_drift": self.relative_drift,
             "missing_reported": self.missing_reported,
             "missing_estimate": self.missing_estimate,
+            "estimated_tokens": self.estimated_tokens,
+            "reported_tokens": self.reported_tokens,
+            "token_drift": self.token_drift,
             "flagged": self.flagged,
+            "cause": self.cause,
             "reason": self.reason,
         }
 
@@ -90,6 +122,14 @@ class ReconciliationReport:
         return [m for m in self.models if m.flagged]
 
     @property
+    def causes(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for model in self.flagged_models:
+            if model.cause:
+                counts[model.cause] = counts.get(model.cause, 0) + 1
+        return counts
+
+    @property
     def ok(self) -> bool:
         return self.status == STATUS_OK
 
@@ -106,6 +146,7 @@ class ReconciliationReport:
             "missing_reported": self.missing_reported,
             "missing_estimate": self.missing_estimate,
             "flagged_models": [m.model for m in self.flagged_models],
+            "causes": self.causes,
             "models": [m.to_dict() for m in self.models],
         }
 
@@ -130,6 +171,12 @@ def reconcile(
             bucket.comparable_runs += 1
             bucket.estimated_cost_usd += float(row.estimated_cost_usd)
             bucket.reported_cost_usd += float(row.reported_cost_usd)
+            estimated_tokens = _sum_tokens(row.estimated_input_tokens, row.estimated_output_tokens)
+            reported_tokens = _sum_tokens(row.prompt_tokens, row.completion_tokens)
+            if estimated_tokens is not None and reported_tokens is not None:
+                bucket.token_comparable_runs += 1
+                bucket.estimated_tokens += estimated_tokens
+                bucket.reported_tokens += reported_tokens
         elif has_estimate:
             bucket.missing_reported += 1
         elif has_reported:
@@ -146,6 +193,7 @@ def reconcile(
             bucket.reason = f"drift ${abs(bucket.absolute_drift_usd):.6f} below ${absolute_floor_usd} floor"
         elif relative is None:
             bucket.flagged = True
+            bucket.cause = CAUSE_NO_PRICE
             bucket.reason = (
                 f"estimated ${bucket.estimated_cost_usd:.6f} but provider reported "
                 f"${bucket.reported_cost_usd:.6f} - a zero estimate against a real charge "
@@ -153,10 +201,29 @@ def reconcile(
             )
         elif abs(relative) > tolerance:
             bucket.flagged = True
-            bucket.reason = (
-                f"reported cost differs from estimate by {relative * 100:.1f}% "
-                f"(tolerance {tolerance * 100:.1f}%) - refresh the catalog"
-            )
+            token_drift = bucket.token_drift
+            if token_drift is not None and abs(token_drift) > TOKEN_TOLERANCE:
+                bucket.cause = CAUSE_TOKEN_ESTIMATE
+                bucket.reason = (
+                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%), "
+                    f"and token count off by {token_drift * 100:.1f}% "
+                    f"({bucket.estimated_tokens} estimated vs {bucket.reported_tokens} actual) - "
+                    "the TaskSpec token sizes are wrong, not the catalog price"
+                )
+            elif token_drift is not None:
+                bucket.cause = CAUSE_STALE_PRICE
+                bucket.reason = (
+                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%) "
+                    f"while token counts agree within {token_drift * 100:.1f}% - "
+                    "the catalog price is stale, run refresh"
+                )
+            else:
+                bucket.cause = CAUSE_STALE_PRICE
+                bucket.reason = (
+                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%); "
+                    "no token counts recorded, so this is most likely a stale catalog "
+                    "price - run refresh"
+                )
         else:
             bucket.reason = f"within tolerance ({relative * 100:.1f}%)"
 
@@ -175,6 +242,12 @@ def reconcile(
     else:
         report.status = STATUS_OK
     return report
+
+
+def _sum_tokens(first: int | None, second: int | None) -> int | None:
+    if first is None or second is None:
+        return None
+    return int(first) + int(second)
 
 
 def format_report(report: ReconciliationReport) -> str:

@@ -182,12 +182,25 @@ reconciliation: DRIFT
   reported             $0.032400
   drift                $+0.019600 (+153.1%)
   missing reported     1
-  [FLAG] openai/gpt-4.1-mini: reported cost differs from estimate by 153.1% (tolerance 10.0%) - refresh the catalog
+  [FLAG] openai/gpt-4.1-mini: cost off by 153.1% (tolerance 10.0%) while token counts agree within 0.0% - the catalog price is stale, run refresh
 ```
 
 Runs carrying only one of the two numbers are counted separately and excluded
 from the drift maths - treating a missing reported cost as `$0.00` would
 manufacture a 100% drift, and treating it as matching would hide a real one.
+
+Drift has two causes and the report tells them apart rather than guessing. It
+compares the ledger's `estimated_input_tokens`/`estimated_output_tokens` against
+the reported `prompt_tokens`/`completion_tokens`:
+
+| token counts | cost | `cause` |
+| --- | --- | --- |
+| agree | diverges | `stale_catalog_price` - run `refresh` |
+| diverge | diverges | `wrong_token_estimate` - the `TaskSpec` sizes are wrong, the catalog is fine |
+| n/a | estimate is `$0.00`, provider charged | `no_catalog_price` |
+
+Blaming the catalog for a token-estimate error would send someone to refresh a
+catalog that is already correct.
 
 ### Running it with no API key
 
