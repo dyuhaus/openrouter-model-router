@@ -17,6 +17,11 @@ does not, the price is stale; if the token counts disagree too, the estimate was
 built on the wrong sizes. Blaming the catalog for a token-estimate error would
 send someone to refresh a catalog that is already correct.
 
+It names a cause only when *every* run in the cost comparison also carried token
+counts. On partial coverage the token sums and the cost sums cover different
+subsets of runs and cannot be divided against each other, so the cause is
+reported as ``undetermined`` rather than guessed.
+
 Drift is reported per model and overall. A run that carries only one of the two
 numbers is *excluded from the drift maths and counted separately*, because
 silently treating a missing reported cost as $0.00 would manufacture a 100%
@@ -37,6 +42,7 @@ TOKEN_TOLERANCE = 0.10  # Token drift beyond this means the estimate's sizes wer
 CAUSE_STALE_PRICE = "stale_catalog_price"
 CAUSE_TOKEN_ESTIMATE = "wrong_token_estimate"
 CAUSE_NO_PRICE = "no_catalog_price"
+CAUSE_UNDETERMINED = "undetermined"  # Cost is wrong; the evidence cannot say why.
 
 STATUS_OK = "ok"
 STATUS_DRIFT = "drift"
@@ -67,6 +73,18 @@ class ModelDrift:
         return round((self.reported_tokens - self.estimated_tokens) / self.estimated_tokens, 6)
 
     @property
+    def token_evidence_is_complete(self) -> bool:
+        """True when every run in the cost comparison also carried token counts.
+
+        When it is False the token sums cover a *different subset of runs* than
+        the cost sums, so the two cannot be divided against each other to name a
+        cause. Diagnosing from partial coverage would let one untokened,
+        wildly-overcharged run hide behind a handful of well-behaved ones.
+        """
+
+        return self.comparable_runs > 0 and self.token_comparable_runs == self.comparable_runs
+
+    @property
     def absolute_drift_usd(self) -> float:
         return round(self.reported_cost_usd - self.estimated_cost_usd, 8)
 
@@ -89,6 +107,8 @@ class ModelDrift:
             "estimated_tokens": self.estimated_tokens,
             "reported_tokens": self.reported_tokens,
             "token_drift": self.token_drift,
+            "token_comparable_runs": self.token_comparable_runs,
+            "token_evidence_is_complete": self.token_evidence_is_complete,
             "flagged": self.flagged,
             "cause": self.cause,
             "reason": self.reason,
@@ -202,27 +222,29 @@ def reconcile(
         elif abs(relative) > tolerance:
             bucket.flagged = True
             token_drift = bucket.token_drift
-            if token_drift is not None and abs(token_drift) > TOKEN_TOLERANCE:
+            head = f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%)"
+            if not bucket.token_evidence_is_complete:
+                # Partial or absent token coverage. Say the cost is wrong; do NOT
+                # name a cause the evidence cannot support.
+                bucket.cause = CAUSE_UNDETERMINED
+                covered = f"{bucket.token_comparable_runs} of {bucket.comparable_runs}"
+                bucket.reason = (
+                    f"{head}; only {covered} comparable run(s) carried token counts, "
+                    "so a stale catalog price cannot be told apart from a wrong "
+                    "TaskSpec token estimate - refresh the catalog first, then re-check"
+                )
+            elif abs(token_drift) > TOKEN_TOLERANCE:
                 bucket.cause = CAUSE_TOKEN_ESTIMATE
                 bucket.reason = (
-                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%), "
-                    f"and token count off by {token_drift * 100:.1f}% "
+                    f"{head}, and token count off by {token_drift * 100:.1f}% "
                     f"({bucket.estimated_tokens} estimated vs {bucket.reported_tokens} actual) - "
                     "the TaskSpec token sizes are wrong, not the catalog price"
-                )
-            elif token_drift is not None:
-                bucket.cause = CAUSE_STALE_PRICE
-                bucket.reason = (
-                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%) "
-                    f"while token counts agree within {token_drift * 100:.1f}% - "
-                    "the catalog price is stale, run refresh"
                 )
             else:
                 bucket.cause = CAUSE_STALE_PRICE
                 bucket.reason = (
-                    f"cost off by {relative * 100:.1f}% (tolerance {tolerance * 100:.1f}%); "
-                    "no token counts recorded, so this is most likely a stale catalog "
-                    "price - run refresh"
+                    f"{head} while token counts agree within {token_drift * 100:.1f}% - "
+                    "the catalog price is stale, run refresh"
                 )
         else:
             bucket.reason = f"within tolerance ({relative * 100:.1f}%)"

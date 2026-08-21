@@ -3,6 +3,7 @@ import unittest
 from openrouter_model_router.ledger import RunRecord
 from openrouter_model_router.reconcile import (
     CAUSE_NO_PRICE,
+    CAUSE_UNDETERMINED,
     CAUSE_STALE_PRICE,
     CAUSE_TOKEN_ESTIMATE,
     STATUS_DRIFT,
@@ -48,8 +49,9 @@ class ReconcileTests(unittest.TestCase):
         drift = report.flagged_models[0]
         self.assertAlmostEqual(drift.absolute_drift_usd, 0.30)
         self.assertAlmostEqual(drift.relative_drift, 3.0)
-        self.assertEqual(drift.cause, CAUSE_STALE_PRICE)
-        self.assertIn("stale catalog price", drift.reason)
+        # No token counts were recorded, so the cause CANNOT be named.
+        self.assertEqual(drift.cause, CAUSE_UNDETERMINED)
+        self.assertIn("cannot be told apart", drift.reason)
         self.assertIn("FLAG", format_report(report))
 
     def test_agreeing_tokens_with_diverging_cost_blames_the_catalog(self):
@@ -83,6 +85,45 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(drift.estimated_tokens, 2000)
         self.assertEqual(drift.reported_tokens, 282)
         self.assertEqual(report.causes, {CAUSE_TOKEN_ESTIMATE: 1})
+
+    # --- NEGATIVE CONTROL -------------------------------------------------
+    def test_partial_token_coverage_refuses_to_name_a_cause(self):
+        """Token sums and cost sums would cover different subsets of runs, so
+        dividing one by the other is not evidence. One untokened, wildly
+        overcharged run must not hide behind well-behaved ones."""
+
+        report = reconcile(
+            [
+                _run(model="m", estimated=0.10, reported=0.10,
+                     est_tokens=(1000, 1000), actual_tokens=(1000, 1000)),
+                _run(model="m", estimated=0.10, reported=5.00),  # no token counts
+            ]
+        )
+
+        drift = report.flagged_models[0]
+        self.assertEqual(drift.comparable_runs, 2)
+        self.assertEqual(drift.token_comparable_runs, 1)
+        self.assertFalse(drift.token_evidence_is_complete)
+        self.assertEqual(drift.cause, CAUSE_UNDETERMINED)
+        self.assertIn("only 1 of 2 comparable run(s) carried token counts", drift.reason)
+        self.assertNotIn("token sizes are wrong", drift.reason)
+
+    def test_full_token_coverage_does_name_a_cause(self):
+        """Positive control for the rule above: with complete coverage the same
+        machinery does commit to an answer."""
+
+        report = reconcile(
+            [
+                _run(model="m", estimated=0.10, reported=0.50,
+                     est_tokens=(1000, 1000), actual_tokens=(1000, 1000)),
+                _run(model="m", estimated=0.10, reported=0.50,
+                     est_tokens=(1000, 1000), actual_tokens=(1000, 1000)),
+            ]
+        )
+
+        drift = report.flagged_models[0]
+        self.assertTrue(drift.token_evidence_is_complete)
+        self.assertEqual(drift.cause, CAUSE_STALE_PRICE)
 
     def test_zero_estimate_against_a_real_charge_is_flagged(self):
         """The exact bug this repo shipped: a $0.00 estimate that cost money."""

@@ -197,10 +197,14 @@ the reported `prompt_tokens`/`completion_tokens`:
 | --- | --- | --- |
 | agree | diverges | `stale_catalog_price` - run `refresh` |
 | diverge | diverges | `wrong_token_estimate` - the `TaskSpec` sizes are wrong, the catalog is fine |
+| incomplete | diverges | `undetermined` - not enough evidence to say |
 | n/a | estimate is `$0.00`, provider charged | `no_catalog_price` |
 
 Blaming the catalog for a token-estimate error would send someone to refresh a
-catalog that is already correct.
+catalog that is already correct. A cause is named only when *every* run in the
+cost comparison also carried token counts - otherwise the token sums and the
+cost sums cover different subsets of runs and cannot be divided against each
+other, so the report says `undetermined` rather than guessing.
 
 ### Running it with no API key
 
