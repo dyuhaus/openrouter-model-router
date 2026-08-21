@@ -158,6 +158,11 @@ class RunLedger:
 
         estimated = _sum_optional(r.estimated_cost_usd for r in rows)
         reported = _sum_optional(r.reported_cost_usd for r in rows)
+        # A total summed over rows that carried no estimate is a total of an
+        # unknown share of the spend. Say how many rows it skipped rather than
+        # letting the number pass for the whole bill.
+        missing_estimate = sum(1 for r in rows if r.estimated_cost_usd is None)
+        missing_reported = sum(1 for r in rows if r.reported_cost_usd is None)
         wasted = _sum_optional(
             r.reported_cost_usd if r.reported_cost_usd is not None else r.estimated_cost_usd
             for r in rows
@@ -184,6 +189,13 @@ class RunLedger:
             "completion_tokens": int(_sum_optional(r.completion_tokens for r in rows)),
             "estimated_cost_usd": round(estimated, 6),
             "reported_cost_usd": round(reported, 6),
+            "runs_missing_estimate": missing_estimate,
+            "runs_missing_reported": missing_reported,
+            "estimated_cost_is_complete": missing_estimate == 0,
+            "estimated_cost_note": (
+                f"summed over {total - missing_estimate} of {total} run(s); "
+                f"{missing_estimate} carried no estimate and contribute nothing to this total"
+            ),
             "cost_of_failed_runs_usd": round(wasted, 6),
             "retry_multiplier": multiplier,
             "retry_multiplier_measured": measured,
@@ -197,10 +209,19 @@ def _by_model(rows: list[RunRecord]) -> dict[str, dict[str, Any]]:
     for row in rows:
         bucket = out.setdefault(
             row.model,
-            {"runs": 0, "completed": 0, "failed": 0, "estimated_cost_usd": 0.0, "reported_cost_usd": 0.0},
+            {
+                "runs": 0,
+                "completed": 0,
+                "failed": 0,
+                "estimated_cost_usd": 0.0,
+                "reported_cost_usd": 0.0,
+                "runs_missing_estimate": 0,
+            },
         )
         bucket["runs"] += 1
         bucket["completed" if row.succeeded else "failed"] += 1
+        if row.estimated_cost_usd is None:
+            bucket["runs_missing_estimate"] += 1
         bucket["estimated_cost_usd"] = round(bucket["estimated_cost_usd"] + (row.estimated_cost_usd or 0.0), 6)
         bucket["reported_cost_usd"] = round(bucket["reported_cost_usd"] + (row.reported_cost_usd or 0.0), 6)
     return out

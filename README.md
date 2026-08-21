@@ -123,12 +123,47 @@ The package therefore keeps the two apart everywhere the number is used:
   prefers a known price over an unknown one when scores tie.
 - `max_cost_usd` **excludes** unpriced models. A ceiling that admits a model of
   unbounded price is not a ceiling.
-- The ledger records `estimated_cost_usd: null` rather than `0.0`.
+- The ledger records `estimated_cost_usd: null` rather than `0.0`, and
+  `ledger` reports `runs_missing_estimate` so a total summed over an unknown
+  share of the runs cannot pass for the whole bill.
+- `reconcile` sums real charges on runs with no estimate into
+  `unreconciled_reported_cost_usd`, names the unpriced models, and refuses to
+  report `ok` while any of that money is outstanding.
 
-Verified against the live catalog on 2026-08-21: 420 models, 415 with a known
-price (394 charging something, 21 published at exactly `$0.00`), 5 carrying the
-`-1` sentinel. At 34K in / 81K out the five sentinel models report `UNKNOWN` and
-no priced model reports `$0.00`.
+**`pricing_known` is derived from the prices, never read as a flag.** The flag
+used to be *defaulted* on load - `bool(data.get("pricing_known", True))` - while
+the prices beside it were read as `float(x or 0.0)`. A record with no pricing at
+all therefore came back off disk as "price known: $0.00", and every hardened
+consumer downstream did exactly what it was told about a number nobody measured.
+`ModelInfo.from_dict` now re-derives the answer from the data:
+
+| record on disk | verdict |
+| --- | --- |
+| no price keys at all | **UNKNOWN** |
+| `null` on either side | **UNKNOWN** |
+| `-1` on either side (the sentinel, written through) | **UNKNOWN** |
+| one side published, the other absent | **UNKNOWN** |
+| non-numeric junk | **UNKNOWN** |
+| `pricing_known: true` beside absent or negative prices | **UNKNOWN** - a flag is not evidence of a price |
+| `pricing_known: false` beside real prices | **UNKNOWN** - the verdict is never overridden upward |
+| `0.0` / `0.0` with no `pricing_known` | **UNKNOWN** - indistinguishable from the old clamped sentinel, and every schema_version 1 catalog is full of that shape |
+| `0.0` / `0.0` with `pricing_known: true` | known, genuinely **free** |
+| real prices, flag or no flag | known |
+
+The same derivation runs in `ModelInfo.__post_init__`, so `ModelInfo(id="x")`
+with no prices is UNKNOWN rather than a confident $0.00 as well.
+
+Verified against the live catalog on 2026-08-21, before and after the
+derivation change, with identical results: 420 models, 415 with a known price
+(394 charging something, 21 published at exactly `$0.00`), 5 carrying the `-1`
+sentinel, 0 unaccounted for. At 34K in / 81K out the five sentinel models report
+`UNKNOWN` and no priced model reports `$0.00`. The priced tiers are unchanged to
+the cent, run against the same catalog on both sides of the change:
+`mistralai/ministral-8b` **$0.0126**, `openai/gpt-4.1-mini` **$0.1432**,
+`google/gemini-2.5-flash` **$0.2127**, `openai/gpt-5` **$0.8525**,
+`anthropic/claude-sonnet-4` **$1.3170**. Deriving the flag costs a real catalog
+nothing, because a real catalog states its prices - it only stops a *record
+missing them* from claiming one.
 
 ### Catalog staleness
 

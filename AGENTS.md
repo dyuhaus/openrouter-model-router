@@ -30,6 +30,16 @@ and nothing complained.
 - **Unpriced is not free.** `pricing_known=False` marks models whose price the
   provider does not publish (the `-1` sentinel on the meta-routers, or no
   pricing block). Their `$0.00` estimate is not a measurement.
+- **A flag is not evidence; derive it from the data.** `pricing_known` is
+  computed from the prices actually present every time a `ModelInfo` is built,
+  including on load. Never default it to `True`, and never let a stored `true`
+  outrank absent, null, negative or non-numeric prices beside it. When the
+  record is ambiguous the answer is UNKNOWN: refusing to quote is always safer
+  than quoting zero, because zero is the number that wins every cost comparison.
+- **Money nobody could estimate is not $0.00 of spend.** Reported charges on
+  runs with no estimate are summed and reported on their own
+  (`unreconciled_reported_cost_usd`); a reconciliation report may not say `ok`
+  while real dollars sit outside the comparison.
 - **Record every attempt.** The ledger takes gate failures and errors as well as
   successes. The retry multiplier is attempts-over-accepted-outputs; a
   success-only ledger can only ever report 1.0, and the cost model stays a guess.

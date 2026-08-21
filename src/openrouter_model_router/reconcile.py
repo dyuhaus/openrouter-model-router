@@ -26,6 +26,12 @@ Drift is reported per model and overall. A run that carries only one of the two
 numbers is *excluded from the drift maths and counted separately*, because
 silently treating a missing reported cost as $0.00 would manufacture a 100%
 drift, and treating it as "matching" would hide a real one.
+
+Excluded is not forgotten. Real dollars charged on a run the estimator could not
+price are summed into ``unreconciled_reported_cost_usd`` and reported as their
+own verdict. Dropping them would let a model with unknown pricing spend real
+money underneath a report headed OK -- absence of an estimate rendering as $0.00
+of spend, which is the same defect as an unpriced model rendering as free.
 """
 
 from __future__ import annotations
@@ -48,6 +54,11 @@ CAUSE_UNDETERMINED = "undetermined"  # Cost is wrong; the evidence cannot say wh
 STATUS_OK = "ok"
 STATUS_DRIFT = "drift"
 STATUS_INSUFFICIENT_DATA = "insufficient_data"
+
+#: Verdict for a report where real money was charged on runs carrying no
+#: estimate. The drift maths cannot say anything about those dollars, so the
+#: report may not say "ok" about them either.
+VERDICT_UNRECONCILED = "unreconciled_cost"
 
 #: What a staleness answer looks like when no catalog was handed in. This is NOT
 #: "fresh" - a report run without a catalog has checked nothing, and a check that
@@ -72,6 +83,13 @@ class ModelDrift:
     estimated_tokens: int = 0
     reported_tokens: int = 0
     token_comparable_runs: int = 0
+    #: Dollars the provider actually charged on runs that carried no estimate.
+    #: These are outside the drift maths by design and must not vanish.
+    unreconciled_reported_cost_usd: float = 0.0
+    #: What the catalog says about this model's price, when a catalog was passed:
+    #: True (published), False (UNKNOWN -- the -1 sentinel or no pricing block),
+    #: or None (no catalog, or the model is not in it).
+    pricing_known: bool | None = None
     flagged: bool = False
     cause: str | None = None
     reason: str = ""
@@ -121,6 +139,9 @@ class ModelDrift:
             "token_drift": self.token_drift,
             "token_comparable_runs": self.token_comparable_runs,
             "token_evidence_is_complete": self.token_evidence_is_complete,
+            "unreconciled_reported_cost_usd": round(self.unreconciled_reported_cost_usd, 8),
+            "pricing_known": self.pricing_known,
+            "pricing_status": _pricing_status(self.pricing_known),
             "flagged": self.flagged,
             "cause": self.cause,
             "reason": self.reason,
@@ -137,6 +158,8 @@ class ReconciliationReport:
     reported_cost_usd: float = 0.0
     missing_reported: int = 0
     missing_estimate: int = 0
+    unreconciled_reported_cost_usd: float = 0.0
+    absolute_floor_usd: float = DEFAULT_ABSOLUTE_FLOOR_USD
     models: list[ModelDrift] = field(default_factory=list)
     catalog: dict[str, Any] = field(default_factory=lambda: dict(CATALOG_NOT_CHECKED))
 
@@ -163,6 +186,23 @@ class ReconciliationReport:
         return counts
 
     @property
+    def has_unreconciled_cost(self) -> bool:
+        """Real dollars sit outside the comparison entirely.
+
+        Not "small drift" -- unmeasured spend. The estimator produced no number
+        for these runs, so no tolerance applies to them and nothing in the drift
+        maths would ever mention them.
+        """
+
+        return self.unreconciled_reported_cost_usd > self.absolute_floor_usd
+
+    @property
+    def pricing_unknown_models(self) -> list[str]:
+        """Ledger models the catalog cannot price. Empty when no catalog was passed."""
+
+        return [m.model for m in self.models if m.pricing_known is False]
+
+    @property
     def catalog_checked(self) -> bool:
         return bool(self.catalog.get("checked"))
 
@@ -186,6 +226,8 @@ class ReconciliationReport:
             return "drift"
         if self.catalog_is_stale:
             return "stale_catalog"
+        if self.has_unreconciled_cost:
+            return VERDICT_UNRECONCILED
         if self.status == STATUS_INSUFFICIENT_DATA:
             return STATUS_INSUFFICIENT_DATA
         return STATUS_OK
@@ -199,7 +241,7 @@ class ReconciliationReport:
         is two unverified numbers agreeing with each other.
         """
 
-        return self.status == STATUS_OK and not self.catalog_is_stale
+        return self.status == STATUS_OK and not self.catalog_is_stale and not self.has_unreconciled_cost
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -214,6 +256,9 @@ class ReconciliationReport:
             "relative_drift": self.relative_drift,
             "missing_reported": self.missing_reported,
             "missing_estimate": self.missing_estimate,
+            "unreconciled_reported_cost_usd": round(self.unreconciled_reported_cost_usd, 8),
+            "has_unreconciled_cost": self.has_unreconciled_cost,
+            "pricing_unknown_models": self.pricing_unknown_models,
             "flagged_models": [m.model for m in self.flagged_models],
             "causes": self.causes,
             "catalog": dict(self.catalog),
@@ -240,7 +285,9 @@ def reconcile(
     """
 
     rows = list(records)
-    report = ReconciliationReport(tolerance=tolerance, total_runs=len(rows))
+    report = ReconciliationReport(
+        tolerance=tolerance, total_runs=len(rows), absolute_floor_usd=absolute_floor_usd
+    )
     if catalog is not None:
         staleness = catalog.staleness(max_age_days=max_catalog_age_days)
         staleness["checked"] = True
@@ -265,14 +312,26 @@ def reconcile(
             bucket.missing_reported += 1
         elif has_reported:
             bucket.missing_estimate += 1
+            # Money that was really charged and that no estimate covers. Held
+            # separately rather than dropped: a model the catalog cannot price
+            # would otherwise spend real dollars invisibly under an OK report.
+            bucket.unreconciled_reported_cost_usd += float(row.reported_cost_usd)
         else:
             bucket.missing_reported += 1
             bucket.missing_estimate += 1
 
     for bucket in buckets.values():
+        if catalog is not None:
+            entry = catalog.get(bucket.model)
+            bucket.pricing_known = None if entry is None else entry.pricing_known
         relative = bucket.relative_drift
         if bucket.comparable_runs == 0:
             bucket.reason = "no run carried both an estimate and a reported cost"
+            if bucket.unreconciled_reported_cost_usd > absolute_floor_usd:
+                bucket.reason += (
+                    f"; ${bucket.unreconciled_reported_cost_usd:.6f} was charged with no estimate to check it "
+                    "against" + (" (catalog price UNKNOWN)" if bucket.pricing_known is False else "")
+                )
         elif abs(bucket.absolute_drift_usd) < absolute_floor_usd:
             bucket.reason = f"drift ${abs(bucket.absolute_drift_usd):.6f} below ${absolute_floor_usd} floor"
         elif relative is None:
@@ -318,6 +377,7 @@ def reconcile(
         report.reported_cost_usd += bucket.reported_cost_usd
         report.missing_reported += bucket.missing_reported
         report.missing_estimate += bucket.missing_estimate
+        report.unreconciled_reported_cost_usd += bucket.unreconciled_reported_cost_usd
 
     report.models = sorted(buckets.values(), key=lambda m: m.model)
 
@@ -328,6 +388,14 @@ def reconcile(
     else:
         report.status = STATUS_OK
     return report
+
+
+def _pricing_status(pricing_known: bool | None) -> str:
+    """Never renders an unknown price as anything a reader could read as free."""
+
+    if pricing_known is None:
+        return "not_checked"
+    return "known" if pricing_known else "UNKNOWN"
 
 
 def _sum_tokens(first: int | None, second: int | None) -> int | None:
@@ -351,6 +419,8 @@ def format_report(report: ReconciliationReport) -> str:
         + (f" ({report.relative_drift * 100:+.1f}%)" if report.relative_drift is not None else ""),
         f"  missing reported     {report.missing_reported}",
         f"  missing estimate     {report.missing_estimate}",
+        f"  unreconciled charge  ${report.unreconciled_reported_cost_usd:.6f}"
+        + ("  <-- real money no estimate covers" if report.has_unreconciled_cost else ""),
     ]
     catalog = report.catalog
     if not catalog.get("checked"):
@@ -370,7 +440,31 @@ def format_report(report: ReconciliationReport) -> str:
 
     for model in report.models:
         marker = "FLAG" if model.flagged else "ok  "
-        lines.append(f"  [{marker}] {model.model}: {model.reason}")
+        price_note = ""
+        if model.pricing_known is False:
+            # Said out loud on every line for this model. "$0.00 estimated" and
+            # "no price exists" must never look the same in a report a human
+            # skims for a dollar figure.
+            price_note = " [catalog price UNKNOWN - its estimates are not measurements]"
+        lines.append(f"  [{marker}] {model.model}: {model.reason}{price_note}")
+
+    if report.pricing_unknown_models:
+        lines.append("")
+        lines.append(
+            "  !! UNPRICED MODELS IN THIS LEDGER: "
+            + ", ".join(report.pricing_unknown_models)
+        )
+        lines.append("     The catalog publishes no price for these, so a $0.00 estimate")
+        lines.append("     from them is an absence of measurement, not an absence of cost.")
+
+    if report.has_unreconciled_cost:
+        lines.append("")
+        lines.append(
+            f"  !! ${report.unreconciled_reported_cost_usd:.6f} WAS CHARGED ON {report.missing_estimate} RUN(S) "
+            "CARRYING NO ESTIMATE."
+        )
+        lines.append("     Nothing above verified those dollars: they are outside the drift")
+        lines.append("     maths entirely, and no tolerance was applied to them.")
 
     if report.catalog_is_stale:
         lines.append("")

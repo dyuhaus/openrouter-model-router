@@ -189,6 +189,15 @@ def _select(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps(selection.to_dict(), indent=2, sort_keys=True))
+    if not selection.estimated_cost_is_known:
+        # The router is allowed to pick an unpriced model on quality or speed.
+        # It is not allowed to let anyone believe the $0.00 beside it is a price.
+        print(
+            f"WARNING: {selection.model_id} has NO published price - its "
+            f"estimated_cost_usd of $0.00 is an absence of measurement, not a cost. "
+            "Use --max-cost to exclude unpriced models from selection entirely.",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -268,6 +277,13 @@ def _estimate(args: argparse.Namespace) -> int:
 
     if staleness["status"] != STALENESS_FRESH:
         print(f"WARNING: {staleness['reason']}", file=sys.stderr)
+    unpriced_ids = [row["model"] for row in rows if not row["pricing_known"]]
+    if unpriced_ids and priced:
+        print(
+            "WARNING: no price exists for " + ", ".join(unpriced_ids) + " - those rows report "
+            "UNKNOWN and are absent from every total in this output. Do NOT read them as $0.00.",
+            file=sys.stderr,
+        )
     if rows and priced == 0:
         print(
             f"none of the {len(rows)} requested model(s) carries a usable price, so this "
@@ -345,6 +361,20 @@ def _reconcile(args: argparse.Namespace) -> int:
         return 1
     if report.catalog_is_stale:
         print(f"catalog is stale: {report.catalog.get('reason')}", file=sys.stderr)
+        return 1
+    if report.has_unreconciled_cost:
+        # Real dollars that no estimate covers were never compared to anything.
+        # Exiting 0 here would report a pass over spend nobody checked.
+        print(
+            f"reconcile found ${report.unreconciled_reported_cost_usd:.6f} charged on "
+            f"{report.missing_estimate} run(s) with no estimate"
+            + (
+                " (unpriced models: " + ", ".join(report.pricing_unknown_models) + ")"
+                if report.pricing_unknown_models
+                else ""
+            ),
+            file=sys.stderr,
+        )
         return 1
     if report.status == STATUS_INSUFFICIENT_DATA:
         # Zero comparable runs is a configuration failure, not a pass. Exiting 0
