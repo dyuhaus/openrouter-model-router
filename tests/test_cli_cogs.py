@@ -45,15 +45,28 @@ class CliCostTests(unittest.TestCase):
         self.assertAlmostEqual(row["estimated_cost_usd"], 0.078)
         self.assertTrue(row["pricing_known"])
 
-    def test_estimate_marks_an_unpriced_model_rather_than_quoting_zero(self):
-        code, out, _ = run_cli(
+    def test_estimate_reports_an_unpriced_model_as_unknown_not_as_zero(self):
+        """UNKNOWN and $0.00 are different facts and only one is safe to budget on.
+
+        Tightened from an earlier version of this test, which accepted
+        `estimated_cost_usd == 0.0` with a `pricing_known: false` flag beside it.
+        A reader (or a script summing the column) sees the number, not the flag,
+        and 0.0 is the cheapest possible number. The estimate is now null, and
+        the command exits non-zero because it produced no cost estimate at all.
+        """
+
+        code, out, err = run_cli(
             ["estimate", "--catalog", str(self.catalog_path), "--model", "openrouter/auto"]
         )
 
-        row = json.loads(out)["estimates"][0]
-        self.assertEqual(code, 0)
-        self.assertEqual(row["estimated_cost_usd"], 0.0)
-        self.assertFalse(row["pricing_known"], "a $0.00 quote must be labelled unpriced")
+        payload = json.loads(out)
+        row = payload["estimates"][0]
+        self.assertIsNone(row["estimated_cost_usd"], "an unknown price must not print as a number")
+        self.assertEqual(row["pricing_status"], "UNKNOWN")
+        self.assertFalse(row["pricing_known"])
+        self.assertEqual(payload["priced_estimates"], 0)
+        self.assertEqual(code, 1, "an estimate command that priced 0 models must not exit 0")
+        self.assertIn("not $0.00", err)
 
     # --- NEGATIVE CONTROL -------------------------------------------------
     def test_estimate_against_a_missing_catalog_fails_loudly(self):

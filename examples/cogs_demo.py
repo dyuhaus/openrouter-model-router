@@ -7,6 +7,7 @@ Shows the whole measurement chain:
   2. a model call         ->  usage read back off the response (REPORTED cost)
   3. every attempt        ->  one ledger row, successes and failures alike
   4. estimate vs reported ->  a reconciliation report that flags drift
+  5. the age of the prices -> a staleness check that can actually fail
 
 The model calls go through :class:`FakeTransport`, so the only thing simulated
 here is the provider. Everything else -- prices, arithmetic, ledger, drift
@@ -23,6 +24,7 @@ import copy
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from openrouter_model_router import (
@@ -134,10 +136,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(ledger.summary(), indent=2))
 
         print("\n4. RECONCILIATION")
-        report = reconcile(ledger.read_all())
+        report = reconcile(ledger.read_all(), catalog=router.catalog)
         print(format_report(report))
 
+        # 5. The same report against a catalog stamped 90 days ago. Nothing else
+        # changes: same ledger, same prices, same drift. The only new fact is how
+        # old the prices are, and that alone is enough to fail the report.
+        print("\n5. THE SAME LEDGER AGAINST A 90-DAY-OLD CATALOG")
+        aged = ModelCatalog(list(router.catalog), fetched_at=_stamp(90 * 86_400))
+        stale_report = reconcile(ledger.read_all(), catalog=aged)
+        print(format_report(stale_report))
+
         return 1 if report.flagged_models else 0
+
+
+def _stamp(seconds_ago: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
 
 
 if __name__ == "__main__":

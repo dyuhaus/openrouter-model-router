@@ -8,6 +8,7 @@ dependency clearly pays for itself.
 
 - Run tests: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`
 - Live catalog smoke test: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m openrouter_model_router.cli research --catalog /tmp/openrouter-model-router-catalog.json --timeout 30`
+- Catalog freshness gate: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m openrouter_model_router.cli catalog-status --catalog /tmp/openrouter-model-router-catalog.json`
 - Cost demo (no key, no network): `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 examples/cogs_demo.py`
 
 ## Rules
@@ -34,6 +35,14 @@ and nothing complained.
   success-only ledger can only ever report 1.0, and the cost model stays a guess.
 - **A gate that raises has failed.** Never let an exception in a validator read
   as a pass.
+- **A check that examined nothing has not passed.** Zero comparable runs, zero
+  models, an unreadable timestamp: all of these exit non-zero. "I could not tell"
+  and "it was fine" must never share an exit code.
+- **The fetch time belongs to the fetch.** `ModelCatalog.fetched_at` is written
+  by a refresh and by nothing else. `updated_at` moves on any local edit, so
+  deriving freshness from it means a 2019 catalog reports as fetched today - the
+  bug that made the staleness advice in the reconciliation report unactionable.
+  Anything claiming a catalog is current must be able to fail on `catalog-status`.
 - **Every new checker ships with a negative control.** Break it deliberately,
   watch the test fail, and say so in the PR. A validator that has never been
   seen to fail is indistinguishable from one that does nothing.

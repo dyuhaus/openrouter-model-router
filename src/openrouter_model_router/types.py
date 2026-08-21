@@ -78,6 +78,19 @@ class ModelInfo:
         completion = max(0, output_tokens) * max(0.0, self.output_cost_per_million) / 1_000_000
         return prompt + completion
 
+    def cost_estimate(self, input_tokens: int, output_tokens: int) -> float | None:
+        """Cost in USD, or None when the provider published no usable price.
+
+        Use this anywhere a human or a report will read the number.
+        ``estimated_cost_usd`` returns 0.0 for an unpriced model, which is the
+        right arithmetic for scoring and the wrong thing to print: $0.00 and
+        "unknown" are different facts, and only one of them is safe to budget on.
+        """
+
+        if not self.pricing_known:
+            return None
+        return self.estimated_cost_usd(input_tokens, output_tokens)
+
     @property
     def is_free(self) -> bool:
         """Genuinely $0.00 -- a published price of zero, not an absent price."""

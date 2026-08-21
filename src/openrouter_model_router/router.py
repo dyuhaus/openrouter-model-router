@@ -84,7 +84,16 @@ class ModelRouter:
         scored: list[Selection] = []
         for model, estimated_cost, _, reasons in candidates:
             capability_bonus, capability_reasons = _capability_bonus(model, spec)
-            cost_score = 1.0 - min(1.0, estimated_cost / max_cost)
+            if model.pricing_known:
+                cost_score = 1.0 - min(1.0, estimated_cost / max_cost)
+            else:
+                # An unpriced model estimates $0.00, which would hand it the BEST
+                # possible cost score and let it win every "cheap" comparison
+                # while contributing nothing to the spend estimate. Unknown price
+                # is scored as the worst case, not the best: the router may still
+                # pick it on quality or speed, but never because it looks free.
+                cost_score = 0.0
+                reasons = list(reasons) + ["pricing_unknown:cost scored as worst case"]
             quality = min(1.0, model.quality_score + capability_bonus)
             score = (
                 (quality * weights["quality"])
@@ -102,7 +111,19 @@ class ModelRouter:
                 )
             )
 
-        return max(scored, key=lambda selection: (selection.score, -selection.estimated_cost_usd, selection.model.id))
+        # Tie-break order matters as much as the score. `-estimated_cost_usd`
+        # prefers the cheaper model, and an unpriced model estimates $0.00, so a
+        # tie used to be won by the one candidate whose cost nobody knows. A
+        # known price outranks an unknown one at equal score, always.
+        return max(
+            scored,
+            key=lambda selection: (
+                selection.score,
+                1 if selection.model.pricing_known else 0,
+                -selection.estimated_cost_usd,
+                selection.model.id,
+            ),
+        )
 
     def chat_completion(
         self,
@@ -183,6 +204,7 @@ class ModelRouter:
                     estimated_output_tokens=spec.output_tokens,
                     error=f"{type(exc).__name__}: {exc}",
                     catalog_updated_at=self.catalog.updated_at,
+                    catalog_fetched_at=self.catalog.fetched_at,
                 ),
                 error=exc,
             )
@@ -195,6 +217,7 @@ class ModelRouter:
             "estimated_output_tokens": spec.output_tokens,
             "estimated_cost_usd": selection.estimated_cost_usd if selection.estimated_cost_is_known else None,
             "catalog_updated_at": self.catalog.updated_at,
+            "catalog_fetched_at": self.catalog.fetched_at,
         }
 
         try:
@@ -266,10 +289,15 @@ class ModelRouter:
         if required:
             reasons.append("required_capabilities=" + ",".join(sorted(required)))
 
-        estimated_cost = model.estimated_cost_usd(spec.input_tokens, spec.output_tokens)
-        if spec.max_cost_usd is not None and estimated_cost > spec.max_cost_usd:
-            return False, []
         if spec.max_cost_usd is not None:
+            if not model.pricing_known:
+                # A budget filter that admits models whose price is unknown is
+                # not a budget filter. Their $0.00 estimate passes every ceiling
+                # while the real charge is unbounded.
+                return False, []
+            estimated_cost = model.estimated_cost_usd(spec.input_tokens, spec.output_tokens)
+            if estimated_cost > spec.max_cost_usd:
+                return False, []
             reasons.append(f"cost<={spec.max_cost_usd}")
 
         return True, reasons

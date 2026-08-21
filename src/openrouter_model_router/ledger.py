@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: A run either produced an accepted artifact, produced one the gates rejected,
 #: or never produced one at all. Only ``completed`` counts as a usable output.
@@ -62,6 +62,10 @@ class RunRecord:
     usage_present: bool = False
     usage_source_fields: dict[str, str] = field(default_factory=dict)
     catalog_updated_at: str | None = None
+    #: When the catalog that priced this run was last fetched from OpenRouter.
+    #: Distinct from catalog_updated_at, which moves on any local edit: only this
+    #: field can tell you the prices behind an estimate were months old.
+    catalog_fetched_at: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:

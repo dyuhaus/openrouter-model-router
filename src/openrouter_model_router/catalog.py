@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -12,6 +13,24 @@ from .transport import HttpRequest, HttpTransport, TransportError, UrllibTranspo
 from .types import ModelInfo
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: How old a catalog may get before its prices stop being evidence. OpenRouter's
+#: model list and prices move on a scale of days, so a week is the outer bound of
+#: "this was true when it was written down".
+DEFAULT_MAX_AGE_DAYS = 7.0
+
+STALENESS_FRESH = "fresh"
+STALENESS_STALE = "stale"
+STALENESS_NEVER_FETCHED = "never_fetched"
+STALENESS_UNPARSEABLE = "unparseable_timestamp"
+STALENESS_CLOCK_SKEW = "clock_skew"
+STALENESS_EMPTY = "empty_catalog"
+STALENESS_UNVERIFIABLE = "unverifiable_legacy_timestamp"
+
+#: Tolerated clock skew before a future fetch timestamp is treated as broken
+#: rather than as extremely fresh. A catalog stamped next year would otherwise
+#: read as fresh forever.
+CLOCK_SKEW_TOLERANCE_SECONDS = 86_400.0
 
 
 def default_catalog_path() -> Path:
@@ -37,11 +56,33 @@ class CatalogLoadError(RuntimeError):
 class ModelCatalog:
     """A mutable collection of routable model metadata."""
 
-    def __init__(self, models: Iterable[ModelInfo] | None = None, updated_at: str | None = None) -> None:
+    def __init__(
+        self,
+        models: Iterable[ModelInfo] | None = None,
+        updated_at: str | None = None,
+        fetched_at: str | None = None,
+        fetched_at_is_derived: bool = False,
+    ) -> None:
         self.models: dict[str, ModelInfo] = {}
-        self.updated_at = updated_at or _utc_now()
+        #: When this catalog's contents last came from upstream. A property of
+        #: the FETCH, not of the load: nothing in this class may set it except a
+        #: refresh, or a load reading it back off disk. ``None`` means "never
+        #: fetched", which is not the same as "fetched a long time ago" and is
+        #: never treated as fresh.
+        self.fetched_at = fetched_at
+        #: True when fetched_at was inferred from a schema_version 1 catalog's
+        #: updated_at rather than recorded at a fetch. That value was restamped
+        #: by every load and every local edit, so it is an UPPER BOUND on the
+        #: real fetch time: such a catalog can only ever look fresher than it is,
+        #: and must not be able to report fresh.
+        self.fetched_at_is_derived = bool(fetched_at_is_derived)
         for model in models or []:
             self.upsert(model)
+        # AFTER the loop, on purpose. upsert() stamps updated_at, so assigning
+        # first let every construction - including load() - overwrite the
+        # caller's timestamp with "now". That is how a 2019 catalog reported as
+        # fetched today, and how one load-and-save cycle destroyed the real date.
+        self.updated_at = updated_at or _utc_now()
 
     def __len__(self) -> int:
         return len(self.models)
@@ -56,12 +97,16 @@ class ModelCatalog:
         if not model.id:
             raise ValueError("model id is required")
         self.models[model.id] = model
+        # Local modification time only. fetched_at is deliberately untouched:
+        # recording an outcome or hand-adding a model does not make the prices
+        # any newer than the fetch that produced them.
         self.updated_at = _utc_now()
 
     def to_dict(self, include_raw: bool = False) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "updated_at": self.updated_at,
+            "fetched_at": self.fetched_at,
             "models": [m.to_dict(include_raw=include_raw) for m in sorted(self.models.values(), key=lambda x: x.id)],
         }
 
@@ -89,7 +134,23 @@ class ModelCatalog:
                 "Refusing to fall back to the unpriced bootstrap catalog - "
                 "run `openrouter-model-router refresh` to rewrite it."
             ) from exc
-        return cls(models=models, updated_at=data.get("updated_at"))
+        # schema_version 1 catalogs have no fetched_at key at all. Fall back to
+        # their only timestamp rather than to None, so an old v1 catalog is still
+        # judged stale rather than excused as "never fetched, cannot say".
+        #
+        # Keyed on the key being ABSENT, not on it being falsy. A v2 catalog that
+        # records `"fetched_at": null` is saying "never fetched", and reading
+        # updated_at in its place would restore the exact laundering this fix
+        # removes: updated_at is restamped by any local edit, so an unfetched
+        # catalog would come back from disk looking brand new.
+        is_legacy = "fetched_at" not in data
+        fetched_at = data.get("updated_at") if is_legacy else data["fetched_at"]
+        return cls(
+            models=models,
+            updated_at=data.get("updated_at"),
+            fetched_at=fetched_at,
+            fetched_at_is_derived=is_legacy and fetched_at is not None,
+        )
 
     @classmethod
     def bootstrap(cls) -> "ModelCatalog":
@@ -122,14 +183,20 @@ class ModelCatalog:
                 )
             ],
             updated_at=now,
+            # fetched_at stays None: the bootstrap entry was never fetched from
+            # anywhere, so it must never satisfy a freshness check.
+            fetched_at=None,
         )
 
     @classmethod
-    def from_openrouter_payload(cls, payload: dict[str, Any]) -> "ModelCatalog":
+    def from_openrouter_payload(cls, payload: dict[str, Any], fetched_at: str | None = None) -> "ModelCatalog":
         rows = payload.get("data")
         if not isinstance(rows, list):
             raise CatalogRefreshError("OpenRouter response did not contain a data list")
-        return cls(model_from_openrouter(item) for item in rows if isinstance(item, dict))
+        return cls(
+            (model_from_openrouter(item) for item in rows if isinstance(item, dict)),
+            fetched_at=fetched_at or _utc_now(),
+        )
 
     @classmethod
     def refresh_from_openrouter(
@@ -166,7 +233,9 @@ class ModelCatalog:
             payload = response.json()
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise CatalogRefreshError(f"failed to refresh OpenRouter model catalog: {exc}") from exc
-        return cls.from_openrouter_payload(payload)
+        # Stamped here, at the fetch, which is the only moment that knows when
+        # these prices were true.
+        return cls.from_openrouter_payload(payload, fetched_at=_utc_now())
 
     def pricing_coverage(self) -> dict[str, Any]:
         """How much of this catalog can actually be costed.
@@ -187,6 +256,84 @@ class ModelCatalog:
             "pricing_unknown": len(unknown),
             "pricing_unknown_ids": sorted(m.id for m in unknown)[:25],
         }
+
+    def age_seconds(self, now: float | None = None) -> float | None:
+        """Seconds since the last upstream fetch, or None if that is unknowable."""
+
+        fetched = _parse_utc(self.fetched_at)
+        if fetched is None:
+            return None
+        return (time.time() if now is None else now) - fetched
+
+    def staleness(self, max_age_days: float = DEFAULT_MAX_AGE_DAYS, now: float | None = None) -> dict[str, Any]:
+        """Is this catalog still evidence?
+
+        Only ``fresh`` passes. Every other answer - never fetched, unparseable
+        timestamp, a future timestamp, an empty catalog, or simply old - is a
+        failure, because none of them establish that the prices in here are
+        current. "I cannot tell how old this is" must never be scored as new.
+        """
+
+        max_age_seconds = float(max_age_days) * 86_400.0
+        age = self.age_seconds(now=now)
+        result: dict[str, Any] = {
+            "fetched_at": self.fetched_at,
+            "updated_at": self.updated_at,
+            "max_age_days": float(max_age_days),
+            "models": len(self.models),
+            "age_seconds": None if age is None else round(age, 3),
+            "age_days": None if age is None else round(age / 86_400.0, 4),
+            "fetched_at_is_derived": self.fetched_at_is_derived,
+        }
+
+        if not self.models:
+            # A catalog holding nothing can price nothing. Calling that "fresh"
+            # is a gate passing over zero items.
+            status, reason = STALENESS_EMPTY, "catalog contains 0 models - it can price nothing"
+        elif self.fetched_at is None:
+            status = STALENESS_NEVER_FETCHED
+            reason = "no fetch timestamp: this catalog was never refreshed from OpenRouter"
+        elif age is None:
+            status = STALENESS_UNPARSEABLE
+            reason = f"fetch timestamp {self.fetched_at!r} could not be parsed, so its age is unknown"
+        elif age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+            status = STALENESS_CLOCK_SKEW
+            reason = (
+                f"fetch timestamp {self.fetched_at} is {abs(age) / 86_400.0:.1f} days in the future - "
+                "a clock is wrong and the age cannot be trusted"
+            )
+        elif age > max_age_seconds:
+            # Sound even for a derived timestamp: updated_at is always at or
+            # after the real fetch, so "older than the limit" can only understate.
+            status = STALENESS_STALE
+            reason = (
+                f"catalog was fetched {age / 86_400.0:.1f} days ago (limit {max_age_days:g}) - "
+                "prices may have changed; run `openrouter-model-router refresh`"
+            )
+        elif self.fetched_at_is_derived:
+            # Inside the limit, but the only timestamp available was restamped on
+            # every load by the version that wrote this file. It is an upper
+            # bound, so "recent" here is not evidence of anything. One refresh
+            # replaces it with a real fetch time.
+            status = STALENESS_UNVERIFIABLE
+            reason = (
+                f"this is a schema_version 1 catalog with no fetch timestamp; its updated_at "
+                f"({self.updated_at}) was restamped on every load, so an apparent age of "
+                f"{age / 86_400.0:.1f} days is an upper bound and proves nothing - "
+                "run `openrouter-model-router refresh` once to record a real fetch time"
+            )
+        else:
+            status = STALENESS_FRESH
+            reason = f"catalog fetched {max(0.0, age) / 86_400.0:.1f} days ago (limit {max_age_days:g})"
+
+        result["status"] = status
+        result["fresh"] = status == STALENESS_FRESH
+        result["stale"] = status != STALENESS_FRESH
+        result["reason"] = reason
+        return result
+
+    def is_stale(self, max_age_days: float = DEFAULT_MAX_AGE_DAYS, now: float | None = None) -> bool:
+        return bool(self.staleness(max_age_days=max_age_days, now=now)["stale"])
 
     def merge(self, other: "ModelCatalog", preserve_observations: bool = True) -> tuple[int, int]:
         """Merge another catalog into this one.
@@ -209,6 +356,13 @@ class ModelCatalog:
                 incoming.reliability_score = _weighted_refresh(existing.reliability_score, incoming.reliability_score)
             updated += 1
             self.upsert(incoming)
+        # The merged catalog is only as fresh as the newest fetch that fed it.
+        # max(), not "take the incoming one": merging an OLD catalog in must not
+        # be able to make this one look newer, and must not silently age it either.
+        mine, theirs = _parse_utc(self.fetched_at), _parse_utc(other.fetched_at)
+        if theirs is not None and (mine is None or theirs > mine):
+            self.fetched_at = other.fetched_at
+            self.fetched_at_is_derived = other.fetched_at_is_derived
         return added, updated
 
     def record_outcome(
@@ -406,6 +560,27 @@ def _price_per_million(value: Any) -> float:
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_utc(value: Any) -> float | None:
+    """Parse a catalog timestamp into a POSIX time, or None if it is unusable.
+
+    Returns None rather than a default: an unreadable timestamp is an unknown
+    age, and an unknown age must not be silently scored as zero (brand new).
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _ema(previous: float, observation: float, alpha: float = 0.25) -> float:

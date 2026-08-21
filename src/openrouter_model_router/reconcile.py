@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from .catalog import DEFAULT_MAX_AGE_DAYS, STALENESS_FRESH, ModelCatalog
 from .ledger import RunRecord
 
 DEFAULT_TOLERANCE = 0.10  # 10% relative drift before a model is flagged.
@@ -47,6 +48,17 @@ CAUSE_UNDETERMINED = "undetermined"  # Cost is wrong; the evidence cannot say wh
 STATUS_OK = "ok"
 STATUS_DRIFT = "drift"
 STATUS_INSUFFICIENT_DATA = "insufficient_data"
+
+#: What a staleness answer looks like when no catalog was handed in. This is NOT
+#: "fresh" - a report run without a catalog has checked nothing, and a check that
+#: examined nothing may not report a pass.
+CATALOG_NOT_CHECKED = {
+    "status": "not_checked",
+    "fresh": False,
+    "stale": False,
+    "checked": False,
+    "reason": "no catalog was passed to reconcile(), so its age was never checked",
+}
 
 
 @dataclass
@@ -126,6 +138,7 @@ class ReconciliationReport:
     missing_reported: int = 0
     missing_estimate: int = 0
     models: list[ModelDrift] = field(default_factory=list)
+    catalog: dict[str, Any] = field(default_factory=lambda: dict(CATALOG_NOT_CHECKED))
 
     @property
     def absolute_drift_usd(self) -> float:
@@ -150,12 +163,48 @@ class ReconciliationReport:
         return counts
 
     @property
+    def catalog_checked(self) -> bool:
+        return bool(self.catalog.get("checked"))
+
+    @property
+    def catalog_is_stale(self) -> bool:
+        """True only when a catalog WAS checked and failed the age test."""
+
+        return self.catalog_checked and bool(self.catalog.get("stale"))
+
+    @property
+    def verdict(self) -> str:
+        """The whole report's answer, not just the drift maths'.
+
+        ``status`` describes cost drift alone, so a stale catalog or an empty
+        comparison used to leave a report headed "OK" while the command exited
+        non-zero. A header that disagrees with the exit code is how a reader ends
+        up believing the reassuring half.
+        """
+
+        if self.status == STATUS_DRIFT:
+            return "drift"
+        if self.catalog_is_stale:
+            return "stale_catalog"
+        if self.status == STATUS_INSUFFICIENT_DATA:
+            return STATUS_INSUFFICIENT_DATA
+        return STATUS_OK
+
+    @property
     def ok(self) -> bool:
-        return self.status == STATUS_OK
+        """Everything the report can vouch for held.
+
+        A stale catalog fails this even when every drift number is inside
+        tolerance, because a drift comparison against prices nobody has refreshed
+        is two unverified numbers agreeing with each other.
+        """
+
+        return self.status == STATUS_OK and not self.catalog_is_stale
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "verdict": self.verdict,
             "tolerance": self.tolerance,
             "total_runs": self.total_runs,
             "comparable_runs": self.comparable_runs,
@@ -167,6 +216,9 @@ class ReconciliationReport:
             "missing_estimate": self.missing_estimate,
             "flagged_models": [m.model for m in self.flagged_models],
             "causes": self.causes,
+            "catalog": dict(self.catalog),
+            "catalog_is_stale": self.catalog_is_stale,
+            "ok": self.ok,
             "models": [m.to_dict() for m in self.models],
         }
 
@@ -176,11 +228,23 @@ def reconcile(
     *,
     tolerance: float = DEFAULT_TOLERANCE,
     absolute_floor_usd: float = DEFAULT_ABSOLUTE_FLOOR_USD,
+    catalog: ModelCatalog | None = None,
+    max_catalog_age_days: float = DEFAULT_MAX_AGE_DAYS,
 ) -> ReconciliationReport:
-    """Compare estimated against reported cost and flag models that drift."""
+    """Compare estimated against reported cost and flag models that drift.
+
+    Pass ``catalog`` to have the age of the prices checked as well. The drift
+    maths compares an estimate built from catalog prices against what the
+    provider charged; if nobody knows how old those prices are, "within
+    tolerance" is not a finding.
+    """
 
     rows = list(records)
     report = ReconciliationReport(tolerance=tolerance, total_runs=len(rows))
+    if catalog is not None:
+        staleness = catalog.staleness(max_age_days=max_catalog_age_days)
+        staleness["checked"] = True
+        report.catalog = staleness
     buckets: dict[str, ModelDrift] = {}
 
     for row in rows:
@@ -275,8 +339,11 @@ def _sum_tokens(first: int | None, second: int | None) -> int | None:
 def format_report(report: ReconciliationReport) -> str:
     """Human-readable reconciliation summary."""
 
+    header = f"reconciliation: {report.verdict.upper()}"
+    if report.verdict != report.status:
+        header += f"  (cost drift: {report.status})"
     lines = [
-        f"reconciliation: {report.status.upper()}",
+        header,
         f"  runs                 {report.total_runs} ({report.comparable_runs} comparable)",
         f"  estimated            ${report.estimated_cost_usd:.6f}",
         f"  reported             ${report.reported_cost_usd:.6f}",
@@ -285,7 +352,35 @@ def format_report(report: ReconciliationReport) -> str:
         f"  missing reported     {report.missing_reported}",
         f"  missing estimate     {report.missing_estimate}",
     ]
+    catalog = report.catalog
+    if not catalog.get("checked"):
+        lines.append("  catalog age         NOT CHECKED (pass --catalog to check it)")
+    else:
+        # Name the actual status. Labelling an unverifiable legacy timestamp
+        # "STALE" would be a second inaccuracy on top of the one being reported.
+        status_name = str(catalog.get("status") or "unknown")
+        marker = "ok" if status_name == STALENESS_FRESH else status_name.split("_")[0].upper()
+        age = catalog.get("age_days")
+        age_text = "unknown" if age is None else f"{age:.1f}d"
+        lines.append(
+            f"  catalog age         [{marker}] {age_text} "
+            f"(fetched {catalog.get('fetched_at') or 'never'}, {catalog.get('models')} models)"
+        )
+        lines.append(f"                      {catalog.get('reason')}")
+
     for model in report.models:
         marker = "FLAG" if model.flagged else "ok  "
         lines.append(f"  [{marker}] {model.model}: {model.reason}")
+
+    if report.catalog_is_stale:
+        lines.append("")
+        lines.append(
+            f"  !! CATALOG NOT FRESH ({report.catalog.get('status')}): every estimated cost above"
+        )
+        lines.append("     was computed from prices of unknown currency. Run")
+        lines.append("     `openrouter-model-router refresh` and re-run.")
+    if report.status == STATUS_INSUFFICIENT_DATA:
+        lines.append("")
+        lines.append("  !! NOTHING WAS COMPARED: 0 runs carried both an estimate and a reported")
+        lines.append("     cost. This is a configuration failure, not a clean bill of health.")
     return "\n".join(lines)

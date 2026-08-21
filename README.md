@@ -15,6 +15,7 @@ A small, dependency-free Python package for choosing an OpenRouter model for the
 - **Reads `usage` back off every response** and returns reported tokens and cost alongside the content.
 - **Appends a run ledger** (JSONL) with one row per call - successes, gate failures, and errors alike.
 - **Reconciles estimated against reported cost** and flags drift, which is how a stale catalog gets caught.
+- **Knows how old its own prices are.** The catalog records the time of the *fetch*, and `catalog-status` exits non-zero on anything it cannot prove is fresh.
 
 The package stores state in normal JSON files and reads secrets only from environment variables or explicit constructor arguments.
 
@@ -108,9 +109,74 @@ model carries a usable price.
 
 **Unknown pricing is not free pricing.** `ModelInfo.pricing_known` is `False`
 for the five meta-routers that publish a `-1` sentinel and for any model with no
-pricing block. Those models estimate `$0.00`, so `Selection.estimated_cost_is_known`
-tells you whether that zero is a measurement or the absence of one, and the
-ledger records `estimated_cost_usd: null` rather than `0.0` for them.
+pricing block. Zero is the *best possible* number in every cost comparison, so an
+unknown price left as `0.0` wins the cheap route, slips under every budget
+ceiling, and adds nothing to the spend estimate while the bill arrives anyway.
+The package therefore keeps the two apart everywhere the number is used:
+
+- `ModelInfo.cost_estimate()` returns `None`, not `0.0`, for an unpriced model.
+  `estimated_cost_usd()` still returns a number, because scoring needs one.
+- `estimate` prints `"estimated_cost_usd": null` with `"pricing_status": "UNKNOWN"`,
+  and **exits non-zero when none of the requested models could be priced** - a
+  command that produced no cost estimate has not succeeded.
+- The router scores an unknown price as the **worst** case, not the best, and
+  prefers a known price over an unknown one when scores tie.
+- `max_cost_usd` **excludes** unpriced models. A ceiling that admits a model of
+  unbounded price is not a ceiling.
+- The ledger records `estimated_cost_usd: null` rather than `0.0`.
+
+Verified against the live catalog on 2026-08-21: 420 models, 415 with a known
+price (394 charging something, 21 published at exactly `$0.00`), 5 carrying the
+`-1` sentinel. At 34K in / 81K out the five sentinel models report `UNKNOWN` and
+no priced model reports `$0.00`.
+
+### Catalog staleness
+
+The fetch time is a property of the **fetch**, not of the load. `fetched_at` is
+written by `refresh` and by nothing else; `updated_at` moves on any local edit,
+including `record-outcome`. Keeping them apart is what makes staleness
+detectable at all - an earlier version stamped `updated_at` on every `load()`,
+so a catalog written in 2019 reported as fetched today and one load-and-save
+cycle overwrote the real date on disk.
+
+```bash
+openrouter-model-router catalog-status --catalog ~/.cache/openrouter-model-router/catalog.json
+```
+
+```text
+catalog: STALE
+  path            /path/to/catalog.json
+  models          420
+  fetched_at      2026-05-23T14:26:13Z
+  updated_at      2026-08-21T14:25:28Z
+  age             90.00 days
+  limit           7 days
+  catalog was fetched 90.0 days ago (limit 7) - prices may have changed; run `openrouter-model-router refresh`
+```
+
+Exit code is 0 **only** for a catalog proven fresh. Every other answer exits 1,
+including the ones that are not literally "old":
+
+| condition | status | exits |
+| --- | --- | --- |
+| fetched inside the limit (default 7 days) | `fresh` | 0 |
+| fetched longer ago than the limit | `stale` | 1 |
+| never fetched (`fetched_at: null`, incl. the bootstrap catalog) | `never_fetched` | 1 |
+| a `schema_version: 1` catalog inside the limit | `unverifiable_legacy_timestamp` | 1 |
+| timestamp cannot be parsed | `unparseable_timestamp` | 1 |
+| timestamp is in the future beyond clock skew | `clock_skew` | 1 |
+| catalog holds 0 models | `empty_catalog` | 1 |
+
+"I cannot tell how old this is" is never scored as new, and a catalog holding
+nothing is a configuration failure rather than a pass.
+
+A `schema_version: 1` catalog written before this change has no fetch timestamp
+at all - the version that wrote it restamped `updated_at` on every load, so that
+value is an *upper bound* on the real fetch time and such a catalog can only ever
+look fresher than it is. It is therefore reported as `unverifiable_legacy_timestamp`
+while it is inside the limit, and plainly `stale` once its upper bound is outside
+it (which is sound, since the real fetch was at or before that). One `refresh`
+records a real fetch time and clears it.
 
 ### Reading usage back
 
@@ -172,7 +238,7 @@ A gate that raises is a **failed** gate, not a passed one.
 ### Reconciliation
 
 ```bash
-openrouter-model-router reconcile --fail-on-drift
+openrouter-model-router reconcile --catalog ~/.cache/openrouter-model-router/catalog.json --fail-on-drift
 ```
 
 ```text
@@ -182,8 +248,27 @@ reconciliation: DRIFT
   reported             $0.032400
   drift                $+0.019600 (+153.1%)
   missing reported     1
+  catalog age         [ok] 0.4d (fetched 2026-08-21T14:25:28Z, 420 models)
+                      catalog fetched 0.4 days ago (limit 7)
   [FLAG] openai/gpt-4.1-mini: cost off by 153.1% (tolerance 10.0%) while token counts agree within 0.0% - the catalog price is stale, run refresh
 ```
+
+Pass `--catalog` and the age of the prices is checked alongside the drift maths.
+Without it the report says `catalog age NOT CHECKED` - never "fresh", because a
+check that never ran has not passed.
+
+`--fail-on-drift` exits non-zero on three things, not one:
+
+1. any model drifting past the tolerance;
+2. a **stale catalog**, even when every drift number is inside tolerance - a
+   drift comparison against prices nobody has refreshed is two unverified
+   numbers agreeing with each other;
+3. **zero comparable runs**. An empty ledger, or one where no row carried both an
+   estimate and a reported cost, verified nothing. Exiting 0 there is a gate
+   printing a pass over nothing.
+
+The header line reports the whole verdict (`STALE_CATALOG (cost drift: ok)`), not
+just the drift status, so it can never read `OK` on a run that exits 1.
 
 Runs carrying only one of the two numbers are counted separately and excluded
 from the drift maths - treating a missing reported cost as `$0.00` would
@@ -258,6 +343,19 @@ export OPENROUTER_API_KEY=...
 openrouter-model-router refresh
 ```
 
+`refresh` fails rather than writing nothing over something: a response carrying
+zero models exits non-zero and leaves the existing catalog alone, and a refresh
+in which no model carries a usable price also exits non-zero. Both would
+otherwise leave every downstream estimate at `$0.00` with a successful-looking
+run behind it.
+
+Check the age of what you have without fetching anything:
+
+```bash
+openrouter-model-router catalog-status          # exit 0 only when it is fresh
+openrouter-model-router catalog-status --json --max-age-days 3
+```
+
 ## CLI Selection
 
 ```bash
@@ -311,5 +409,6 @@ Then pass `model` to the same OpenRouter-compatible client you already use.
 - Use `max_cost_usd` for user-facing or batch workflows.
 - Use `record-outcome` or `ModelCatalog.record_outcome()` after calls to let observed quality, success, and latency tune future routing.
 - Commit a curated catalog for fully deterministic deployments, or refresh into an uncommitted runtime cache for constantly updated routing.
-- Run `openrouter-model-router reconcile --fail-on-drift` in CI or after a batch. Drift past the tolerance means the catalog is stale and every cost number downstream is wrong.
-- Never treat `estimated_cost_usd == 0.0` as free without checking `estimated_cost_is_known`.
+- Run `openrouter-model-router reconcile --catalog <path> --fail-on-drift` in CI or after a batch. Drift past the tolerance means the catalog is stale and every cost number downstream is wrong.
+- Run `openrouter-model-router catalog-status` as its own gate before a costed batch. It is cheap, needs no ledger, and fails on a catalog nobody has refreshed.
+- Never treat `estimated_cost_usd == 0.0` as free without checking `estimated_cost_is_known`. Prefer `cost_estimate()`, which returns `None`.
