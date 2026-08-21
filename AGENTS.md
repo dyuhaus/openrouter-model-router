@@ -62,7 +62,7 @@ and nothing complained.
   when `OPENROUTER_API_KEY` is unset.
 
 ## Git Workflow (machine standard)
-This repo follows /home/dyadmin/AGENTS.md "Git Workflow Standard".
+This repo follows the machine-level `AGENTS.md` "Git Workflow Standard".
 - Default branch: main (protected, PR-only, squash merge)
 - Branches: feat/ fix/ chore/ docs/ exp/ (+ agent/<harness>/ optional)
 - Commits: Conventional Commits; hooks must pass; never --no-verify

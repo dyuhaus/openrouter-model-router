@@ -1,8 +1,9 @@
 """Injectable HTTP transport, plus a Fake that makes the whole client testable
 with no API key and no network.
 
-No API key exists on this machine, so the model-calling path has to be provably
-exercisable today. Everything that touches HTTP goes through :class:`HttpTransport`;
+The model-calling path must be provably exercisable without a credential, so
+that a caller can validate cost accounting before paying for anything.
+Everything that touches HTTP goes through :class:`HttpTransport`;
 :class:`UrllibTransport` is the real one (standard library only) and
 :class:`FakeTransport` is a first-class, shipped implementation -- not a test
 fixture -- so downstream projects can run their own cost accounting end to end

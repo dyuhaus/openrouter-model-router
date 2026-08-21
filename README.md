@@ -24,7 +24,7 @@ The package stores state in normal JSON files and reads secrets only from enviro
 From this checkout:
 
 ```bash
-pip install -e /home/dyadmin/openrouter-model-router
+pip install -e .
 ```
 
 No runtime dependencies are installed.
