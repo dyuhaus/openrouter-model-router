@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .transport import HttpRequest, HttpTransport, TransportError, UrllibTransport
-from .types import ModelInfo
+from .types import ModelInfo, coerce_price
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -255,6 +255,10 @@ class ModelCatalog:
             "free": len(free),
             "pricing_unknown": len(unknown),
             "pricing_unknown_ids": sorted(m.id for m in unknown)[:25],
+            # free + priced + pricing_unknown must account for every model. If it
+            # does not, some model is in none of the three buckets and the
+            # coverage number is not describing the catalog it was built from.
+            "unaccounted": len(models) - len(priced) - len(free) - len(unknown),
         }
 
     def age_seconds(self, now: float | None = None) -> float | None:
@@ -536,19 +540,11 @@ def _pricing_is_known(pricing: Any) -> bool:
 
     if not isinstance(pricing, dict):
         return False
-    prompt = pricing.get("prompt")
-    completion = pricing.get("completion")
-    if prompt is None and completion is None:
-        return False
-    for value in (prompt, completion):
-        if value is None:
-            continue
-        try:
-            if float(value) < 0:
-                return False
-        except (TypeError, ValueError):
-            return False
-    return True
+    # BOTH sides, not either. A record publishing a prompt price and nothing for
+    # completion cannot be costed: the missing half would silently contribute
+    # $0.00 to every estimate. Verified 2026-08-21 against the live catalog:
+    # 0 of 420 models publish only one side, so this costs nothing real.
+    return coerce_price(pricing.get("prompt")) is not None and coerce_price(pricing.get("completion")) is not None
 
 
 def _price_per_million(value: Any) -> float:

@@ -3,7 +3,63 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from typing import Any
+
+#: What ``pricing_known`` means when nobody said: DERIVE it, do not assume it.
+#: The old default was ``True``, so a record carrying no price at all loaded as
+#: "price known: $0.00" and the estimator quoted a confident zero.
+PRICING_UNSPECIFIED = None
+
+
+def coerce_price(value: Any) -> float | None:
+    """A usable price in USD, or ``None`` when the value is not a price.
+
+    ``None`` for absent, null, non-numeric, NaN/inf, and negative values --
+    OpenRouter publishes ``-1`` on its meta-routers to mean "depends where this
+    routes". Never 0.0 as a stand-in: collapsing "no price" into "zero price" is
+    the entire defect this function exists to prevent.
+    """
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def derive_pricing_known(input_price: Any, output_price: Any, declared: Any = PRICING_UNSPECIFIED) -> bool:
+    """Is there a real published price here? Derived from the data, not trusted.
+
+    The rules, in the safe direction every time:
+
+    * either side absent, null, negative (the ``-1`` sentinel) or non-numeric
+      -> **UNKNOWN**, even if the record claims ``pricing_known: true``. A flag
+      written on disk is not evidence of a price; the prices are.
+    * ``declared is False`` -> **UNKNOWN**. Whoever wrote the record knew
+      something the numbers do not show (the bootstrap entry, the clamped
+      sentinel), and that verdict is never overridden upward.
+    * ``declared is True`` with two usable prices -> known. This is how a
+      genuinely free model ($0.00 published by the provider) keeps saying free.
+    * nobody declared anything and both prices are exactly 0.0 -> **UNKNOWN**.
+      Two undeclared zeros are indistinguishable from the old
+      clamp-the-sentinel-to-zero bug, and a schema_version 1 catalog is full of
+      exactly that. One ``refresh`` turns them back into declared prices.
+    """
+
+    prompt = coerce_price(input_price)
+    completion = coerce_price(output_price)
+    if prompt is None or completion is None:
+        return False
+    if declared is False:
+        return False
+    if declared is True:
+        return True
+    return bool(prompt > 0 or completion > 0)
 
 
 @dataclass(frozen=True)
@@ -54,7 +110,11 @@ class ModelInfo:
     #: pricing block, or a negative sentinel such as OpenRouter's "-1" on the
     #: auto-router). A $0.00 estimate from an unpriced model is not "free" -- it
     #: is "unmeasured", and cost accounting must be able to tell them apart.
-    pricing_known: bool = True
+    #:
+    #: Leave it as ``None`` and ``__post_init__`` DERIVES it from the prices
+    #: actually present. It resolves to a real bool before anything reads it.
+    #: Pass ``True`` explicitly to assert a genuine published $0.00.
+    pricing_known: bool | None = PRICING_UNSPECIFIED
     capabilities: tuple[str, ...] = ("text",)
     quality_score: float = 0.5
     speed_score: float = 0.5
@@ -69,6 +129,14 @@ class ModelInfo:
         if not self.provider and "/" in self.id:
             self.provider = self.id.split("/", 1)[0]
         self.capabilities = tuple(sorted({c.strip().lower() for c in self.capabilities if c.strip()}))
+        # Derived, never assumed. Runs BEFORE the prices are clamped, because
+        # clamping is what destroys the evidence: -1 and "no price" both become
+        # 0.0, and 0.0 is the best possible number in every cost comparison.
+        self.pricing_known = derive_pricing_known(
+            self.input_cost_per_million, self.output_cost_per_million, self.pricing_known
+        )
+        self.input_cost_per_million = coerce_price(self.input_cost_per_million) or 0.0
+        self.output_cost_per_million = coerce_price(self.output_cost_per_million) or 0.0
         self.quality_score = _clamp01(self.quality_score)
         self.speed_score = _clamp01(self.speed_score)
         self.reliability_score = _clamp01(self.reliability_score)
@@ -113,9 +181,18 @@ class ModelInfo:
             name=str(data.get("name") or ""),
             provider=str(data.get("provider") or ""),
             context_length=int(data.get("context_length") or 0),
-            input_cost_per_million=float(data.get("input_cost_per_million") or 0.0),
-            output_cost_per_million=float(data.get("output_cost_per_million") or 0.0),
-            pricing_known=bool(data.get("pricing_known", True)),
+            # Read RAW. `float(x or 0.0)` erased the difference between absent,
+            # null, -1 and a real 0.0 before anything could judge it, and
+            # `data.get("pricing_known", True)` then trusted a flag on disk over
+            # the prices beside it. A record with no price loaded as a confident
+            # $0.00. Both halves are now decided by the numbers themselves.
+            input_cost_per_million=coerce_price(data.get("input_cost_per_million")) or 0.0,
+            output_cost_per_million=coerce_price(data.get("output_cost_per_million")) or 0.0,
+            pricing_known=derive_pricing_known(
+                data.get("input_cost_per_million"),
+                data.get("output_cost_per_million"),
+                data.get("pricing_known", PRICING_UNSPECIFIED),
+            ),
             capabilities=tuple(data.get("capabilities") or ("text",)),
             quality_score=float(data.get("quality_score", 0.5)),
             speed_score=float(data.get("speed_score", 0.5)),
@@ -147,6 +224,20 @@ class Selection:
 
         return self.model.pricing_known
 
+    @property
+    def cost_estimate_usd(self) -> float | None:
+        """The estimate as money, or ``None`` when there is no price to quote.
+
+        ``estimated_cost_usd`` stays a float because the scoring arithmetic
+        needs one. This is the field to print, log, or add up.
+        """
+
+        return self.estimated_cost_usd if self.model.pricing_known else None
+
+    @property
+    def pricing_status(self) -> str:
+        return "known" if self.model.pricing_known else "UNKNOWN"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "model_id": self.model.id,
@@ -154,6 +245,10 @@ class Selection:
             "score": self.score,
             "estimated_cost_usd": self.estimated_cost_usd,
             "estimated_cost_is_known": self.model.pricing_known,
+            # Null, not 0.0. A reader scanning JSON for a dollar figure must not
+            # find one where no price exists.
+            "cost_estimate_usd": self.cost_estimate_usd,
+            "pricing_status": self.pricing_status,
             "reasons": list(self.reasons),
             "candidates_considered": self.candidates_considered,
         }
