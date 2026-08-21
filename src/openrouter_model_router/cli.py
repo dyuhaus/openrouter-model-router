@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 from .catalog import OPENROUTER_BASE_URL, CatalogRefreshError, ModelCatalog, default_catalog_path
+from .ledger import RunLedger
+from .reconcile import DEFAULT_TOLERANCE, format_report, reconcile
 from .router import ModelRouter
 from .types import TaskSpec
 
@@ -39,6 +41,28 @@ def main(argv: list[str] | None = None) -> int:
     outcome.add_argument("--latency-ms", type=float, default=None)
     outcome.add_argument("--quality-score", type=float, default=None)
 
+    estimate = subparsers.add_parser(
+        "estimate",
+        help="Estimate the cost of a request on one or more specific models",
+    )
+    estimate.add_argument("--catalog", default=None)
+    estimate.add_argument("--input-tokens", type=int, default=40_000)
+    estimate.add_argument("--output-tokens", type=int, default=120_000)
+    estimate.add_argument("--model", dest="models", action="append", default=[], help="Repeatable")
+
+    ledger_cmd = subparsers.add_parser("ledger", help="Summarize the run ledger")
+    ledger_cmd.add_argument("--ledger", default=None)
+
+    recon = subparsers.add_parser("reconcile", help="Compare estimated against provider-reported cost")
+    recon.add_argument("--ledger", default=None)
+    recon.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
+    recon.add_argument("--json", action="store_true", help="Emit JSON instead of a text report")
+    recon.add_argument(
+        "--fail-on-drift",
+        action="store_true",
+        help="Exit non-zero when any model drifts past the tolerance",
+    )
+
     args = parser.parse_args(argv)
     if args.command in {"refresh", "research", "update"}:
         return _refresh(args)
@@ -46,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
         return _select(args)
     if args.command == "record-outcome":
         return _record_outcome(args)
+    if args.command == "estimate":
+        return _estimate(args)
+    if args.command == "ledger":
+        return _ledger(args)
+    if args.command == "reconcile":
+        return _reconcile(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -76,7 +106,27 @@ def _refresh(args: argparse.Namespace) -> int:
     current = ModelCatalog.load(path, bootstrap=False) if path.exists() else ModelCatalog()
     added, updated = current.merge(incoming)
     saved = current.save(path, include_raw=args.include_raw)
-    print(json.dumps({"catalog": str(saved), "models": len(current), "added": added, "updated": updated}, indent=2))
+    coverage = current.pricing_coverage()
+    print(
+        json.dumps(
+            {
+                "catalog": str(saved),
+                "models": len(current),
+                "added": added,
+                "updated": updated,
+                "authenticated": bool(api_key),
+                "pricing": coverage,
+            },
+            indent=2,
+        )
+    )
+    if coverage["total"] and coverage["priced"] == 0:
+        print(
+            "refresh wrote a catalog in which NO model carries a usable price; "
+            "every cost estimate from it will be $0.00",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -119,6 +169,71 @@ def _record_outcome(args: argparse.Namespace) -> int:
         return 1
     catalog.save(path)
     print(json.dumps(model.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _estimate(args: argparse.Namespace) -> int:
+    catalog = ModelCatalog.load(args.catalog, bootstrap=False)
+    if len(catalog) == 0:
+        print(
+            "catalog is empty - run `openrouter-model-router refresh` first, "
+            "or every estimate below would be $0.00",
+            file=sys.stderr,
+        )
+        return 1
+
+    rows = []
+    missing = []
+    for model_id in args.models or sorted(m.id for m in catalog)[:3]:
+        model = catalog.get(model_id)
+        if model is None:
+            missing.append(model_id)
+            continue
+        rows.append(
+            {
+                "model": model.id,
+                "input_cost_per_million_usd": model.input_cost_per_million,
+                "output_cost_per_million_usd": model.output_cost_per_million,
+                "pricing_known": model.pricing_known,
+                "context_length": model.context_length,
+                "estimated_cost_usd": round(
+                    model.estimated_cost_usd(args.input_tokens, args.output_tokens), 6
+                ),
+            }
+        )
+
+    print(
+        json.dumps(
+            {
+                "catalog": str(Path(args.catalog).expanduser() if args.catalog else default_catalog_path()),
+                "catalog_updated_at": catalog.updated_at,
+                "catalog_models": len(catalog),
+                "input_tokens": args.input_tokens,
+                "output_tokens": args.output_tokens,
+                "estimates": rows,
+                "unknown_models": missing,
+            },
+            indent=2,
+        )
+    )
+    return 1 if missing else 0
+
+
+def _ledger(args: argparse.Namespace) -> int:
+    ledger = RunLedger(args.ledger)
+    records, errors = ledger.read_with_errors()
+    summary = ledger.summary(records)
+    summary["unreadable_lines"] = errors
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _reconcile(args: argparse.Namespace) -> int:
+    ledger = RunLedger(args.ledger)
+    report = reconcile(ledger.read_all(), tolerance=args.tolerance)
+    print(json.dumps(report.to_dict(), indent=2) if args.json else format_report(report))
+    if args.fail_on_drift and report.flagged_models:
+        return 1
     return 0
 
 

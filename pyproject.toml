@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openrouter-model-router"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight OpenRouter model selection and catalog refresh utility"
 readme = "README.md"
 requires-python = ">=3.10"

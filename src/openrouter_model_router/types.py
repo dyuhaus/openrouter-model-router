@@ -50,6 +50,11 @@ class ModelInfo:
     context_length: int = 0
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
+    #: False when the provider published no usable price for this model (missing
+    #: pricing block, or a negative sentinel such as OpenRouter's "-1" on the
+    #: auto-router). A $0.00 estimate from an unpriced model is not "free" -- it
+    #: is "unmeasured", and cost accounting must be able to tell them apart.
+    pricing_known: bool = True
     capabilities: tuple[str, ...] = ("text",)
     quality_score: float = 0.5
     speed_score: float = 0.5
@@ -73,6 +78,12 @@ class ModelInfo:
         completion = max(0, output_tokens) * max(0.0, self.output_cost_per_million) / 1_000_000
         return prompt + completion
 
+    @property
+    def is_free(self) -> bool:
+        """Genuinely $0.00 -- a published price of zero, not an absent price."""
+
+        return self.pricing_known and self.input_cost_per_million == 0.0 and self.output_cost_per_million == 0.0
+
     def supports(self, capabilities: set[str]) -> bool:
         return capabilities.issubset(set(self.capabilities))
 
@@ -91,6 +102,7 @@ class ModelInfo:
             context_length=int(data.get("context_length") or 0),
             input_cost_per_million=float(data.get("input_cost_per_million") or 0.0),
             output_cost_per_million=float(data.get("output_cost_per_million") or 0.0),
+            pricing_known=bool(data.get("pricing_known", True)),
             capabilities=tuple(data.get("capabilities") or ("text",)),
             quality_score=float(data.get("quality_score", 0.5)),
             speed_score=float(data.get("speed_score", 0.5)),
@@ -116,12 +128,19 @@ class Selection:
     def model_id(self) -> str:
         return self.model.id
 
+    @property
+    def estimated_cost_is_known(self) -> bool:
+        """False when the $0.00 estimate means "no price", not "no charge"."""
+
+        return self.model.pricing_known
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "model_id": self.model.id,
             "model": self.model.to_dict(),
             "score": self.score,
             "estimated_cost_usd": self.estimated_cost_usd,
+            "estimated_cost_is_known": self.model.pricing_known,
             "reasons": list(self.reasons),
             "candidates_considered": self.candidates_considered,
         }

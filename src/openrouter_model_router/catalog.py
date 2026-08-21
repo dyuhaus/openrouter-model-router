@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
+from .transport import HttpRequest, HttpTransport, TransportError, UrllibTransport
 from .types import ModelInfo
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -90,6 +89,10 @@ class ModelCatalog:
                     context_length=128_000,
                     input_cost_per_million=0.0,
                     output_cost_per_million=0.0,
+                    # NOT free -- unpriced. openrouter/auto's real price depends
+                    # on whichever model it routes to, so any estimate built on
+                    # this fallback is $0.00 because nothing was measured.
+                    pricing_known=False,
                     capabilities=("text", "tool_use", "json_mode"),
                     quality_score=0.55,
                     speed_score=0.55,
@@ -115,18 +118,55 @@ class ModelCatalog:
         base_url: str = OPENROUTER_BASE_URL,
         api_key: str | None = None,
         timeout: float = 20.0,
+        transport: HttpTransport | None = None,
     ) -> "ModelCatalog":
+        """Fetch ``GET /models`` and build a catalog from it.
+
+        This endpoint is PUBLIC: verified 2026-08-21 returning HTTP 200 with 420
+        models and no credential. ``api_key`` is optional and only forwarded when
+        present, so a machine with no key can still populate real prices.
+        """
+
         url = f"{base_url.rstrip('/')}/models"
         headers = {"Accept": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        sender = transport or UrllibTransport()
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            response = sender.send(HttpRequest(method="GET", url=url, headers=headers, timeout=timeout))
+        except TransportError as exc:
+            raise CatalogRefreshError(f"failed to refresh OpenRouter model catalog: {exc}") from exc
+
+        if response.status >= 400:
+            detail = response.body.decode("utf-8", errors="replace")[:500]
+            raise CatalogRefreshError(
+                f"failed to refresh OpenRouter model catalog: HTTP {response.status}: {detail}"
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise CatalogRefreshError(f"failed to refresh OpenRouter model catalog: {exc}") from exc
         return cls.from_openrouter_payload(payload)
+
+    def pricing_coverage(self) -> dict[str, Any]:
+        """How much of this catalog can actually be costed.
+
+        A catalog that loads is not a catalog that prices. This is the number to
+        print after a refresh: models whose price is unknown will estimate $0.00
+        and quietly understate spend.
+        """
+
+        models = list(self.models.values())
+        priced = [m for m in models if m.pricing_known and (m.input_cost_per_million or m.output_cost_per_million)]
+        free = [m for m in models if m.is_free]
+        unknown = [m for m in models if not m.pricing_known]
+        return {
+            "total": len(models),
+            "priced": len(priced),
+            "free": len(free),
+            "pricing_unknown": len(unknown),
+            "pricing_unknown_ids": sorted(m.id for m in unknown)[:25],
+        }
 
     def merge(self, other: "ModelCatalog", preserve_observations: bool = True) -> tuple[int, int]:
         """Merge another catalog into this one.
@@ -204,6 +244,7 @@ def model_from_openrouter(raw: dict[str, Any]) -> ModelInfo:
     pricing = raw.get("pricing") if isinstance(raw.get("pricing"), dict) else {}
     prompt_cost = _price_per_million(pricing.get("prompt"))
     completion_cost = _price_per_million(pricing.get("completion"))
+    pricing_known = _pricing_is_known(raw.get("pricing"))
     context_length = int(
         raw.get("context_length")
         or (raw.get("top_provider") or {}).get("context_length")
@@ -221,6 +262,7 @@ def model_from_openrouter(raw: dict[str, Any]) -> ModelInfo:
         context_length=context_length,
         input_cost_per_million=prompt_cost,
         output_cost_per_million=completion_cost,
+        pricing_known=pricing_known,
         capabilities=tuple(sorted(capabilities)),
         quality_score=quality,
         speed_score=speed,
@@ -264,9 +306,7 @@ def infer_capabilities(
         capabilities.add("json_mode")
     if context_length >= 128_000:
         capabilities.add("long_context")
-    if prompt_cost == 0 and completion_cost == 0:
-        capabilities.add("cheap")
-    elif prompt_cost + completion_cost <= 1.0:
+    if _pricing_is_known(raw.get("pricing")) and prompt_cost + completion_cost <= 1.0:
         capabilities.add("cheap")
 
     if any(token in combined for token in ("code", "coder", "codestral", "devstral", "programming")):
@@ -307,6 +347,34 @@ def infer_speed_score(model_id: str, capabilities: set[str]) -> float:
     if any(token in text for token in ("opus", "pro", "max", "ultra", "thinking")):
         score -= 0.15
     return max(0.05, min(0.98, score))
+
+
+def _pricing_is_known(pricing: Any) -> bool:
+    """True only when the provider published a real, non-sentinel price.
+
+    OpenRouter publishes "-1" for prompt/completion on its meta-routers
+    (openrouter/auto and friends) because the real price depends on whichever
+    model the router picks. `_price_per_million` clamps that to 0.0, which is
+    indistinguishable from free -- and a free-looking model wins every
+    cost-weighted comparison while contributing $0.00 to the spend estimate.
+    Verified 2026-08-21: 5 of 420 live models carry the -1 sentinel.
+    """
+
+    if not isinstance(pricing, dict):
+        return False
+    prompt = pricing.get("prompt")
+    completion = pricing.get("completion")
+    if prompt is None and completion is None:
+        return False
+    for value in (prompt, completion):
+        if value is None:
+            continue
+        try:
+            if float(value) < 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _price_per_million(value: Any) -> float:

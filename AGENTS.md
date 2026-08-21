@@ -8,6 +8,7 @@ dependency clearly pays for itself.
 
 - Run tests: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`
 - Live catalog smoke test: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m openrouter_model_router.cli research --catalog /tmp/openrouter-model-router-catalog.json --timeout 30`
+- Cost demo (no key, no network): `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 examples/cogs_demo.py`
 
 ## Rules
 
@@ -15,6 +16,31 @@ dependency clearly pays for itself.
 - Keep OpenRouter credentials in `OPENROUTER_API_KEY` or explicit caller config.
 - Preserve standard-library-only runtime behavior unless the user explicitly wants a heavier integration.
 - Add focused tests for routing, catalog parsing, CLI behavior, or client behavior when changing those areas.
+- Do not commit a refreshed catalog or a run ledger; both are gitignored runtime state.
+
+## Cost Accounting Rules
+
+These exist because this package once estimated $0.00 for a 120K-token request
+and nothing complained.
+
+- **A missing number is `None`, never `0.0`.** Absent usage, absent cost, and
+  absent pricing must all be representable as "unknown". Anything that collapses
+  unknown into zero silently understates spend.
+- **Unpriced is not free.** `pricing_known=False` marks models whose price the
+  provider does not publish (the `-1` sentinel on the meta-routers, or no
+  pricing block). Their `$0.00` estimate is not a measurement.
+- **Record every attempt.** The ledger takes gate failures and errors as well as
+  successes. The retry multiplier is attempts-over-accepted-outputs; a
+  success-only ledger can only ever report 1.0, and the cost model stays a guess.
+- **A gate that raises has failed.** Never let an exception in a validator read
+  as a pass.
+- **Every new checker ships with a negative control.** Break it deliberately,
+  watch the test fail, and say so in the PR. A validator that has never been
+  seen to fail is indistinguishable from one that does nothing.
+- **No credential may be required to test.** Model calls go through
+  `HttpTransport`; `FakeTransport` is shipped in the package so the whole path
+  is exercisable with no key. The live path must fail loudly and send nothing
+  when `OPENROUTER_API_KEY` is unset.
 
 ## Git Workflow (machine standard)
 This repo follows /home/dyadmin/AGENTS.md "Git Workflow Standard".
