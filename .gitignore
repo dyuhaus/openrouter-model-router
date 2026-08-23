@@ -16,3 +16,7 @@ venv/
 .env.*
 !.env.example
 catalog.json
+
+# Runtime state, never committed
+runs.jsonl
+*.runs.jsonl

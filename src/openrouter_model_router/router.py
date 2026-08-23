@@ -1,12 +1,47 @@
-"""Task-aware model selection."""
+"""Task-aware model selection, instrumented for cost."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable, Iterable
 
 from .catalog import ModelCatalog
-from .openrouter import OpenRouterClient
+from .ledger import STATUS_COMPLETED, STATUS_ERROR, STATUS_GATE_FAILED, RunLedger, RunRecord
+from .openrouter import ChatResult, OpenRouterClient, OpenRouterError
 from .types import ModelInfo, Selection, TaskSpec
+
+#: A gate takes the completion and returns either a bool, or the list of reasons
+#: it rejected the output (empty list == passed).
+Gate = Callable[[ChatResult], "bool | Iterable[str]"]
+
+UNSELECTED_MODEL = "<no-model-selected>"
+
+
+@dataclass
+class RunOutcome:
+    """Everything one instrumented model call produced, including its cost."""
+
+    record: RunRecord
+    selection: Selection | None = None
+    result: ChatResult | None = None
+    error: Exception | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.record.succeeded
+
+    @property
+    def content(self) -> str:
+        return self.result.content if self.result else ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record": self.record.to_dict(),
+            "selection": self.selection.to_dict() if self.selection else None,
+            "result": self.result.to_dict() if self.result else None,
+            "error": str(self.error) if self.error else None,
+        }
 
 
 class ModelRouter:
@@ -49,7 +84,16 @@ class ModelRouter:
         scored: list[Selection] = []
         for model, estimated_cost, _, reasons in candidates:
             capability_bonus, capability_reasons = _capability_bonus(model, spec)
-            cost_score = 1.0 - min(1.0, estimated_cost / max_cost)
+            if model.pricing_known:
+                cost_score = 1.0 - min(1.0, estimated_cost / max_cost)
+            else:
+                # An unpriced model estimates $0.00, which would hand it the BEST
+                # possible cost score and let it win every "cheap" comparison
+                # while contributing nothing to the spend estimate. Unknown price
+                # is scored as the worst case, not the best: the router may still
+                # pick it on quality or speed, but never because it looks free.
+                cost_score = 0.0
+                reasons = list(reasons) + ["pricing_unknown:cost scored as worst case"]
             quality = min(1.0, model.quality_score + capability_bonus)
             score = (
                 (quality * weights["quality"])
@@ -67,7 +111,19 @@ class ModelRouter:
                 )
             )
 
-        return max(scored, key=lambda selection: (selection.score, -selection.estimated_cost_usd, selection.model.id))
+        # Tie-break order matters as much as the score. `-estimated_cost_usd`
+        # prefers the cheaper model, and an unpriced model estimates $0.00, so a
+        # tie used to be won by the one candidate whose cost nobody knows. A
+        # known price outranks an unknown one at equal score, always.
+        return max(
+            scored,
+            key=lambda selection: (
+                selection.score,
+                1 if selection.model.pricing_known else 0,
+                -selection.estimated_cost_usd,
+                selection.model.id,
+            ),
+        )
 
     def chat_completion(
         self,
@@ -75,11 +131,143 @@ class ModelRouter:
         client: OpenRouterClient,
         messages: list[dict],
         task: TaskSpec | None = None,
+        ledger: RunLedger | None = None,
+        task_label: str = "",
+        gate: Gate | None = None,
+        attempt: int = 1,
         **kwargs,
     ) -> dict:
-        selection = self.select(task)
-        response = client.chat_completion(selection.model.id, messages, **kwargs)
-        return {"selection": selection, "response": response}
+        """Select a model, call it, and return content plus what it cost.
+
+        Backwards compatible: ``selection`` and ``response`` are still present.
+        ``usage``, ``content``, ``estimated_cost_usd``, ``reported_cost_usd`` and
+        ``record`` are new.
+        """
+
+        outcome = self.run(
+            client=client,
+            messages=messages,
+            task=task,
+            ledger=ledger,
+            task_label=task_label,
+            gate=gate,
+            attempt=attempt,
+            **kwargs,
+        )
+        if outcome.error is not None:
+            raise outcome.error
+        assert outcome.result is not None  # guaranteed when error is None
+        return {
+            "selection": outcome.selection,
+            "response": outcome.result.response,
+            "content": outcome.result.content,
+            "usage": outcome.result.usage,
+            "estimated_cost_usd": outcome.record.estimated_cost_usd,
+            "reported_cost_usd": outcome.record.reported_cost_usd,
+            "record": outcome.record,
+            "outcome": outcome,
+        }
+
+    def run(
+        self,
+        *,
+        client: OpenRouterClient,
+        messages: list[dict],
+        task: TaskSpec | None = None,
+        ledger: RunLedger | None = None,
+        task_label: str = "",
+        gate: Gate | None = None,
+        attempt: int = 1,
+        **kwargs,
+    ) -> RunOutcome:
+        """Instrumented call. Records a ledger row for EVERY outcome.
+
+        A run that errors, and a run whose output the gates reject, are both
+        written to the ledger. That is deliberate: the retry multiplier is
+        attempts-over-accepted-outputs, so a ledger that drops failures can only
+        ever report 1.0 and the cost model stays a guess.
+        """
+
+        spec = (task or TaskSpec()).normalized()
+        selection: Selection | None = None
+        try:
+            selection = self.select(spec)
+        except ValueError as exc:
+            return self._finish(
+                ledger=ledger,
+                record=RunRecord(
+                    model=UNSELECTED_MODEL,
+                    task_label=task_label,
+                    status=STATUS_ERROR,
+                    attempt=attempt,
+                    estimated_input_tokens=spec.input_tokens,
+                    estimated_output_tokens=spec.output_tokens,
+                    error=f"{type(exc).__name__}: {exc}",
+                    catalog_updated_at=self.catalog.updated_at,
+                    catalog_fetched_at=self.catalog.fetched_at,
+                ),
+                error=exc,
+            )
+
+        base = {
+            "model": selection.model.id,
+            "task_label": task_label,
+            "attempt": attempt,
+            "estimated_input_tokens": spec.input_tokens,
+            "estimated_output_tokens": spec.output_tokens,
+            "estimated_cost_usd": selection.estimated_cost_usd if selection.estimated_cost_is_known else None,
+            "catalog_updated_at": self.catalog.updated_at,
+            "catalog_fetched_at": self.catalog.fetched_at,
+        }
+
+        try:
+            result = client.chat(selection.model.id, messages, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - an unrecorded attempt is a lost attempt
+            # Deliberately broader than OpenRouterError. An attempt that dies for
+            # an unexpected reason still consumed an attempt, and a ledger that
+            # only knows about the failures it anticipated understates the retry
+            # multiplier exactly like one that drops failures altogether. The
+            # exception is preserved on the outcome and re-raised by
+            # chat_completion; nothing is swallowed.
+            return self._finish(
+                ledger=ledger,
+                record=RunRecord(status=STATUS_ERROR, error=f"{type(exc).__name__}: {exc}", **base),
+                selection=selection,
+                error=exc,
+            )
+
+        failures = _normalize_gate(gate, result)
+        record = RunRecord(
+            status=STATUS_COMPLETED if not failures else STATUS_GATE_FAILED,
+            gates_passed=not failures,
+            gate_failures=failures,
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            reported_cost_usd=result.usage.reported_cost_usd,
+            latency_ms=result.latency_ms,
+            usage_present=result.usage.present,
+            usage_source_fields=dict(result.usage.source_fields),
+            **base,
+        )
+        return self._finish(ledger=ledger, record=record, selection=selection, result=result)
+
+    @staticmethod
+    def _finish(
+        *,
+        ledger: RunLedger | None,
+        record: RunRecord,
+        selection: Selection | None = None,
+        result: ChatResult | None = None,
+        error: Exception | None = None,
+    ) -> RunOutcome:
+        if ledger is not None:
+            try:
+                ledger.append(record)
+            except OSError as exc:
+                # A ledger that cannot be written is a broken measurement, not a
+                # detail to swallow -- but it must not erase the original failure.
+                raise OSError(f"failed to append to the run ledger: {exc}") from (error or exc)
+        return RunOutcome(record=record, selection=selection, result=result, error=error)
 
     def _compatible(self, model: ModelInfo, spec: TaskSpec) -> tuple[bool, list[str]]:
         reasons: list[str] = []
@@ -101,13 +289,46 @@ class ModelRouter:
         if required:
             reasons.append("required_capabilities=" + ",".join(sorted(required)))
 
-        estimated_cost = model.estimated_cost_usd(spec.input_tokens, spec.output_tokens)
-        if spec.max_cost_usd is not None and estimated_cost > spec.max_cost_usd:
-            return False, []
         if spec.max_cost_usd is not None:
+            if not model.pricing_known:
+                # A budget filter that admits models whose price is unknown is
+                # not a budget filter. Their $0.00 estimate passes every ceiling
+                # while the real charge is unbounded.
+                return False, []
+            estimated_cost = model.estimated_cost_usd(spec.input_tokens, spec.output_tokens)
+            if estimated_cost > spec.max_cost_usd:
+                return False, []
             reasons.append(f"cost<={spec.max_cost_usd}")
 
         return True, reasons
+
+
+def _normalize_gate(gate: Gate | None, result: ChatResult) -> tuple[str, ...]:
+    """Turn a gate's answer into a tuple of failure reasons (empty == passed).
+
+    A gate that itself explodes is a FAILED gate, not a passed one. Treating an
+    exception as "no failures reported" is exactly how a validator ends up
+    indistinguishable from no validator at all.
+    """
+
+    if gate is None:
+        return ()
+    try:
+        verdict = gate(result)
+    except Exception as exc:  # noqa: BLE001 - a broken gate must not read as a pass
+        return (f"gate raised {type(exc).__name__}: {exc}",)
+    if verdict is True:
+        return ()
+    if verdict is False:
+        return ("gate returned False",)
+    if verdict is None:
+        return ("gate returned None (no verdict)",)
+    if isinstance(verdict, str):
+        return (verdict,)
+    try:
+        return tuple(str(item) for item in verdict)
+    except TypeError:
+        return (f"gate returned an uninterpretable verdict: {verdict!r}",)
 
 
 def _capabilities_for_modalities(modalities: tuple[str, ...]) -> set[str]:

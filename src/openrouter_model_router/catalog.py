@@ -5,14 +5,32 @@ from __future__ import annotations
 import json
 import os
 import time
-import urllib.error
-import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .types import ModelInfo
+from .transport import HttpRequest, HttpTransport, TransportError, UrllibTransport
+from .types import ModelInfo, coerce_price
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: How old a catalog may get before its prices stop being evidence. OpenRouter's
+#: model list and prices move on a scale of days, so a week is the outer bound of
+#: "this was true when it was written down".
+DEFAULT_MAX_AGE_DAYS = 7.0
+
+STALENESS_FRESH = "fresh"
+STALENESS_STALE = "stale"
+STALENESS_NEVER_FETCHED = "never_fetched"
+STALENESS_UNPARSEABLE = "unparseable_timestamp"
+STALENESS_CLOCK_SKEW = "clock_skew"
+STALENESS_EMPTY = "empty_catalog"
+STALENESS_UNVERIFIABLE = "unverifiable_legacy_timestamp"
+
+#: Tolerated clock skew before a future fetch timestamp is treated as broken
+#: rather than as extremely fresh. A catalog stamped next year would otherwise
+#: read as fresh forever.
+CLOCK_SKEW_TOLERANCE_SECONDS = 86_400.0
 
 
 def default_catalog_path() -> Path:
@@ -26,14 +44,45 @@ class CatalogRefreshError(RuntimeError):
     """Raised when the OpenRouter catalog cannot be fetched or parsed."""
 
 
+class CatalogLoadError(RuntimeError):
+    """Raised when an on-disk catalog exists but cannot be read.
+
+    Distinct from "no catalog" on purpose. A truncated or hand-edited catalog
+    must not fall through to the unpriced bootstrap, because that failure looks
+    identical to a healthy run right up until every cost estimate is $0.00.
+    """
+
+
 class ModelCatalog:
     """A mutable collection of routable model metadata."""
 
-    def __init__(self, models: Iterable[ModelInfo] | None = None, updated_at: str | None = None) -> None:
+    def __init__(
+        self,
+        models: Iterable[ModelInfo] | None = None,
+        updated_at: str | None = None,
+        fetched_at: str | None = None,
+        fetched_at_is_derived: bool = False,
+    ) -> None:
         self.models: dict[str, ModelInfo] = {}
-        self.updated_at = updated_at or _utc_now()
+        #: When this catalog's contents last came from upstream. A property of
+        #: the FETCH, not of the load: nothing in this class may set it except a
+        #: refresh, or a load reading it back off disk. ``None`` means "never
+        #: fetched", which is not the same as "fetched a long time ago" and is
+        #: never treated as fresh.
+        self.fetched_at = fetched_at
+        #: True when fetched_at was inferred from a schema_version 1 catalog's
+        #: updated_at rather than recorded at a fetch. That value was restamped
+        #: by every load and every local edit, so it is an UPPER BOUND on the
+        #: real fetch time: such a catalog can only ever look fresher than it is,
+        #: and must not be able to report fresh.
+        self.fetched_at_is_derived = bool(fetched_at_is_derived)
         for model in models or []:
             self.upsert(model)
+        # AFTER the loop, on purpose. upsert() stamps updated_at, so assigning
+        # first let every construction - including load() - overwrite the
+        # caller's timestamp with "now". That is how a 2019 catalog reported as
+        # fetched today, and how one load-and-save cycle destroyed the real date.
+        self.updated_at = updated_at or _utc_now()
 
     def __len__(self) -> int:
         return len(self.models)
@@ -48,12 +97,16 @@ class ModelCatalog:
         if not model.id:
             raise ValueError("model id is required")
         self.models[model.id] = model
+        # Local modification time only. fetched_at is deliberately untouched:
+        # recording an outcome or hand-adding a model does not make the prices
+        # any newer than the fetch that produced them.
         self.updated_at = _utc_now()
 
     def to_dict(self, include_raw: bool = False) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "updated_at": self.updated_at,
+            "fetched_at": self.fetched_at,
             "models": [m.to_dict(include_raw=include_raw) for m in sorted(self.models.values(), key=lambda x: x.id)],
         }
 
@@ -68,9 +121,36 @@ class ModelCatalog:
         target = Path(path).expanduser() if path else default_catalog_path()
         if not target.exists():
             return cls.bootstrap() if bootstrap else cls()
-        data = json.loads(target.read_text())
-        models = [ModelInfo.from_dict(item) for item in data.get("models", [])]
-        return cls(models=models, updated_at=data.get("updated_at"))
+        try:
+            data = json.loads(target.read_text())
+            if not isinstance(data, dict):
+                raise CatalogLoadError(f"{target}: expected a JSON object, got {type(data).__name__}")
+            models = [ModelInfo.from_dict(item) for item in data.get("models", [])]
+        except CatalogLoadError:
+            raise
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as exc:
+            raise CatalogLoadError(
+                f"{target} exists but could not be read ({type(exc).__name__}: {exc}). "
+                "Refusing to fall back to the unpriced bootstrap catalog - "
+                "run `openrouter-model-router refresh` to rewrite it."
+            ) from exc
+        # schema_version 1 catalogs have no fetched_at key at all. Fall back to
+        # their only timestamp rather than to None, so an old v1 catalog is still
+        # judged stale rather than excused as "never fetched, cannot say".
+        #
+        # Keyed on the key being ABSENT, not on it being falsy. A v2 catalog that
+        # records `"fetched_at": null` is saying "never fetched", and reading
+        # updated_at in its place would restore the exact laundering this fix
+        # removes: updated_at is restamped by any local edit, so an unfetched
+        # catalog would come back from disk looking brand new.
+        is_legacy = "fetched_at" not in data
+        fetched_at = data.get("updated_at") if is_legacy else data["fetched_at"]
+        return cls(
+            models=models,
+            updated_at=data.get("updated_at"),
+            fetched_at=fetched_at,
+            fetched_at_is_derived=is_legacy and fetched_at is not None,
+        )
 
     @classmethod
     def bootstrap(cls) -> "ModelCatalog":
@@ -90,6 +170,10 @@ class ModelCatalog:
                     context_length=128_000,
                     input_cost_per_million=0.0,
                     output_cost_per_million=0.0,
+                    # NOT free -- unpriced. openrouter/auto's real price depends
+                    # on whichever model it routes to, so any estimate built on
+                    # this fallback is $0.00 because nothing was measured.
+                    pricing_known=False,
                     capabilities=("text", "tool_use", "json_mode"),
                     quality_score=0.55,
                     speed_score=0.55,
@@ -99,14 +183,20 @@ class ModelCatalog:
                 )
             ],
             updated_at=now,
+            # fetched_at stays None: the bootstrap entry was never fetched from
+            # anywhere, so it must never satisfy a freshness check.
+            fetched_at=None,
         )
 
     @classmethod
-    def from_openrouter_payload(cls, payload: dict[str, Any]) -> "ModelCatalog":
+    def from_openrouter_payload(cls, payload: dict[str, Any], fetched_at: str | None = None) -> "ModelCatalog":
         rows = payload.get("data")
         if not isinstance(rows, list):
             raise CatalogRefreshError("OpenRouter response did not contain a data list")
-        return cls(model_from_openrouter(item) for item in rows if isinstance(item, dict))
+        return cls(
+            (model_from_openrouter(item) for item in rows if isinstance(item, dict)),
+            fetched_at=fetched_at or _utc_now(),
+        )
 
     @classmethod
     def refresh_from_openrouter(
@@ -115,18 +205,139 @@ class ModelCatalog:
         base_url: str = OPENROUTER_BASE_URL,
         api_key: str | None = None,
         timeout: float = 20.0,
+        transport: HttpTransport | None = None,
     ) -> "ModelCatalog":
+        """Fetch ``GET /models`` and build a catalog from it.
+
+        This endpoint is PUBLIC: verified 2026-08-21 returning HTTP 200 with 420
+        models and no credential. ``api_key`` is optional and only forwarded when
+        present, so a machine with no key can still populate real prices.
+        """
+
         url = f"{base_url.rstrip('/')}/models"
         headers = {"Accept": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        sender = transport or UrllibTransport()
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            response = sender.send(HttpRequest(method="GET", url=url, headers=headers, timeout=timeout))
+        except TransportError as exc:
             raise CatalogRefreshError(f"failed to refresh OpenRouter model catalog: {exc}") from exc
-        return cls.from_openrouter_payload(payload)
+
+        if response.status >= 400:
+            detail = response.body.decode("utf-8", errors="replace")[:500]
+            raise CatalogRefreshError(
+                f"failed to refresh OpenRouter model catalog: HTTP {response.status}: {detail}"
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CatalogRefreshError(f"failed to refresh OpenRouter model catalog: {exc}") from exc
+        # Stamped here, at the fetch, which is the only moment that knows when
+        # these prices were true.
+        return cls.from_openrouter_payload(payload, fetched_at=_utc_now())
+
+    def pricing_coverage(self) -> dict[str, Any]:
+        """How much of this catalog can actually be costed.
+
+        A catalog that loads is not a catalog that prices. This is the number to
+        print after a refresh: models whose price is unknown will estimate $0.00
+        and quietly understate spend.
+        """
+
+        models = list(self.models.values())
+        priced = [m for m in models if m.pricing_known and (m.input_cost_per_million or m.output_cost_per_million)]
+        free = [m for m in models if m.is_free]
+        unknown = [m for m in models if not m.pricing_known]
+        return {
+            "total": len(models),
+            "priced": len(priced),
+            "free": len(free),
+            "pricing_unknown": len(unknown),
+            "pricing_unknown_ids": sorted(m.id for m in unknown)[:25],
+            # free + priced + pricing_unknown must account for every model. If it
+            # does not, some model is in none of the three buckets and the
+            # coverage number is not describing the catalog it was built from.
+            "unaccounted": len(models) - len(priced) - len(free) - len(unknown),
+        }
+
+    def age_seconds(self, now: float | None = None) -> float | None:
+        """Seconds since the last upstream fetch, or None if that is unknowable."""
+
+        fetched = _parse_utc(self.fetched_at)
+        if fetched is None:
+            return None
+        return (time.time() if now is None else now) - fetched
+
+    def staleness(self, max_age_days: float = DEFAULT_MAX_AGE_DAYS, now: float | None = None) -> dict[str, Any]:
+        """Is this catalog still evidence?
+
+        Only ``fresh`` passes. Every other answer - never fetched, unparseable
+        timestamp, a future timestamp, an empty catalog, or simply old - is a
+        failure, because none of them establish that the prices in here are
+        current. "I cannot tell how old this is" must never be scored as new.
+        """
+
+        max_age_seconds = float(max_age_days) * 86_400.0
+        age = self.age_seconds(now=now)
+        result: dict[str, Any] = {
+            "fetched_at": self.fetched_at,
+            "updated_at": self.updated_at,
+            "max_age_days": float(max_age_days),
+            "models": len(self.models),
+            "age_seconds": None if age is None else round(age, 3),
+            "age_days": None if age is None else round(age / 86_400.0, 4),
+            "fetched_at_is_derived": self.fetched_at_is_derived,
+        }
+
+        if not self.models:
+            # A catalog holding nothing can price nothing. Calling that "fresh"
+            # is a gate passing over zero items.
+            status, reason = STALENESS_EMPTY, "catalog contains 0 models - it can price nothing"
+        elif self.fetched_at is None:
+            status = STALENESS_NEVER_FETCHED
+            reason = "no fetch timestamp: this catalog was never refreshed from OpenRouter"
+        elif age is None:
+            status = STALENESS_UNPARSEABLE
+            reason = f"fetch timestamp {self.fetched_at!r} could not be parsed, so its age is unknown"
+        elif age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+            status = STALENESS_CLOCK_SKEW
+            reason = (
+                f"fetch timestamp {self.fetched_at} is {abs(age) / 86_400.0:.1f} days in the future - "
+                "a clock is wrong and the age cannot be trusted"
+            )
+        elif age > max_age_seconds:
+            # Sound even for a derived timestamp: updated_at is always at or
+            # after the real fetch, so "older than the limit" can only understate.
+            status = STALENESS_STALE
+            reason = (
+                f"catalog was fetched {age / 86_400.0:.1f} days ago (limit {max_age_days:g}) - "
+                "prices may have changed; run `openrouter-model-router refresh`"
+            )
+        elif self.fetched_at_is_derived:
+            # Inside the limit, but the only timestamp available was restamped on
+            # every load by the version that wrote this file. It is an upper
+            # bound, so "recent" here is not evidence of anything. One refresh
+            # replaces it with a real fetch time.
+            status = STALENESS_UNVERIFIABLE
+            reason = (
+                f"this is a schema_version 1 catalog with no fetch timestamp; its updated_at "
+                f"({self.updated_at}) was restamped on every load, so an apparent age of "
+                f"{age / 86_400.0:.1f} days is an upper bound and proves nothing - "
+                "run `openrouter-model-router refresh` once to record a real fetch time"
+            )
+        else:
+            status = STALENESS_FRESH
+            reason = f"catalog fetched {max(0.0, age) / 86_400.0:.1f} days ago (limit {max_age_days:g})"
+
+        result["status"] = status
+        result["fresh"] = status == STALENESS_FRESH
+        result["stale"] = status != STALENESS_FRESH
+        result["reason"] = reason
+        return result
+
+    def is_stale(self, max_age_days: float = DEFAULT_MAX_AGE_DAYS, now: float | None = None) -> bool:
+        return bool(self.staleness(max_age_days=max_age_days, now=now)["stale"])
 
     def merge(self, other: "ModelCatalog", preserve_observations: bool = True) -> tuple[int, int]:
         """Merge another catalog into this one.
@@ -149,6 +360,13 @@ class ModelCatalog:
                 incoming.reliability_score = _weighted_refresh(existing.reliability_score, incoming.reliability_score)
             updated += 1
             self.upsert(incoming)
+        # The merged catalog is only as fresh as the newest fetch that fed it.
+        # max(), not "take the incoming one": merging an OLD catalog in must not
+        # be able to make this one look newer, and must not silently age it either.
+        mine, theirs = _parse_utc(self.fetched_at), _parse_utc(other.fetched_at)
+        if theirs is not None and (mine is None or theirs > mine):
+            self.fetched_at = other.fetched_at
+            self.fetched_at_is_derived = other.fetched_at_is_derived
         return added, updated
 
     def record_outcome(
@@ -204,6 +422,7 @@ def model_from_openrouter(raw: dict[str, Any]) -> ModelInfo:
     pricing = raw.get("pricing") if isinstance(raw.get("pricing"), dict) else {}
     prompt_cost = _price_per_million(pricing.get("prompt"))
     completion_cost = _price_per_million(pricing.get("completion"))
+    pricing_known = _pricing_is_known(raw.get("pricing"))
     context_length = int(
         raw.get("context_length")
         or (raw.get("top_provider") or {}).get("context_length")
@@ -221,6 +440,7 @@ def model_from_openrouter(raw: dict[str, Any]) -> ModelInfo:
         context_length=context_length,
         input_cost_per_million=prompt_cost,
         output_cost_per_million=completion_cost,
+        pricing_known=pricing_known,
         capabilities=tuple(sorted(capabilities)),
         quality_score=quality,
         speed_score=speed,
@@ -264,9 +484,7 @@ def infer_capabilities(
         capabilities.add("json_mode")
     if context_length >= 128_000:
         capabilities.add("long_context")
-    if prompt_cost == 0 and completion_cost == 0:
-        capabilities.add("cheap")
-    elif prompt_cost + completion_cost <= 1.0:
+    if _pricing_is_known(raw.get("pricing")) and prompt_cost + completion_cost <= 1.0:
         capabilities.add("cheap")
 
     if any(token in combined for token in ("code", "coder", "codestral", "devstral", "programming")):
@@ -309,6 +527,26 @@ def infer_speed_score(model_id: str, capabilities: set[str]) -> float:
     return max(0.05, min(0.98, score))
 
 
+def _pricing_is_known(pricing: Any) -> bool:
+    """True only when the provider published a real, non-sentinel price.
+
+    OpenRouter publishes "-1" for prompt/completion on its meta-routers
+    (openrouter/auto and friends) because the real price depends on whichever
+    model the router picks. `_price_per_million` clamps that to 0.0, which is
+    indistinguishable from free -- and a free-looking model wins every
+    cost-weighted comparison while contributing $0.00 to the spend estimate.
+    Verified 2026-08-21: 5 of 420 live models carry the -1 sentinel.
+    """
+
+    if not isinstance(pricing, dict):
+        return False
+    # BOTH sides, not either. A record publishing a prompt price and nothing for
+    # completion cannot be costed: the missing half would silently contribute
+    # $0.00 to every estimate. Verified 2026-08-21 against the live catalog:
+    # 0 of 420 models publish only one side, so this costs nothing real.
+    return coerce_price(pricing.get("prompt")) is not None and coerce_price(pricing.get("completion")) is not None
+
+
 def _price_per_million(value: Any) -> float:
     try:
         return max(0.0, float(value or 0.0) * 1_000_000)
@@ -318,6 +556,27 @@ def _price_per_million(value: Any) -> float:
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_utc(value: Any) -> float | None:
+    """Parse a catalog timestamp into a POSIX time, or None if it is unusable.
+
+    Returns None rather than a default: an unreadable timestamp is an unknown
+    age, and an unknown age must not be silently scored as zero (brand new).
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _ema(previous: float, observation: float, alpha: float = 0.25) -> float:
